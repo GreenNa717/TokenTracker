@@ -23020,6 +23020,463 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 }
 
 
+// ── Command Code (`cmd`, commandcode.ai) — passive session-log reader (issue #630) ──
+//
+// Command Code keeps one JSONL transcript per conversation under
+// `~/.commandcode/projects/<cwd-slug>/<session-id>.jsonl`. The first line is a
+// session header carrying the launch `cwd`; every completed assistant turn
+// appends a record whose TOP-LEVEL `model` and `usage` are Command Code's own
+// accounting for that request:
+//
+//   {"type":"message","id":"…","parentId":"…","timestamp":"…","effort":"…",
+//    "model":"deepseek/deepseek-v4.1-flash",
+//    "usage":{"inputTokens":…,"outputTokens":…,"cacheReadTokens":…,
+//             "cacheWriteTokens":…,"costUsd":…},"message":{…}}
+//
+// Two vendor conventions are load-bearing, both verified against every usage
+// record of a live install (their sum and each individual costUsd reproduce at
+// the published DeepSeek rates to the last float digit):
+//
+//  1. `inputTokens` is OpenAI-style prompt_tokens — it ALREADY INCLUDES cache
+//     reads. `uncached = inputTokens - cacheReadTokens`; storing the column
+//     verbatim double counts cached tokens in `total_tokens`.
+//  2. `costUsd` is the exact amount Command Code billed for the request, so
+//     this source is cost-authoritative (SOURCES_WITH_AUTHORITATIVE_COST in
+//     pricing/index.js). That also keeps DeepSeek's peak-hour table rates from
+//     billing a subscription that charges a flat rate (issue #642).
+//
+// Transcripts are append-only in practice, but a resume/compaction REWRITES the
+// file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
+// per-file snapshot and reconciles it against a subtract-on-change ledger keyed
+// by `sessionId|recordId` — the shape the Qoder-new reader uses. Files whose
+// (size, mtime) pair is unchanged since the previous pass are not re-read.
+const COMMAND_CODE_SOURCE = "command-code";
+const COMMAND_CODE_HOME_DIR = ".commandcode";
+const COMMAND_CODE_PROJECTS_DIR = "projects";
+
+function isCommandCodeSessionLogName(name) {
+  return (
+    typeof name === "string" &&
+    name.endsWith(".jsonl") &&
+    !name.endsWith(".checkpoints.jsonl")
+  );
+}
+
+// Precedence mirrors the other passive readers: an explicit TokenTracker
+// override first, then the CLI's own `~/.commandcode`.
+function resolveCommandCodeHome(env = process.env) {
+  const explicit = env?.TOKENTRACKER_COMMANDCODE_HOME;
+  if (typeof explicit === "string" && explicit.trim()) return path.resolve(explicit.trim());
+  return path.join(os.homedir(), COMMAND_CODE_HOME_DIR);
+}
+
+// Windows users commonly run the `cmd` CLI inside WSL while TokenTracker itself
+// runs natively. Respect the repository-wide WSL mode contract and keep explicit
+// home overrides authoritative: an override is a complete user choice, not one
+// half of an automatic native/WSL discovery pair.
+function resolveCommandCodeHomes(env = process.env, deps = {}) {
+  const override = env?.TOKENTRACKER_COMMANDCODE_HOME;
+  const overridden = typeof override === "string" && override.trim().length > 0;
+  const nativeHome = deps.nativeHome || resolveCommandCodeHome(env);
+  const platform = deps.platform || process.platform;
+  if (overridden || platform !== "win32") return [nativeHome];
+
+  const existsSync = deps.existsSync || fssync.existsSync;
+  let nativeValue = null;
+  try {
+    if (existsSync(nativeHome)) nativeValue = nativeHome;
+  } catch (_error) {}
+
+  const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
+  const wslValue = wsl.shouldProbeWsl(env)
+    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env })
+    : null;
+  const resolved = wsl.resolveAllWin32Paths({
+    nativeValue,
+    wslValue,
+    env,
+    platform,
+  });
+  return [...new Set([resolved.native, resolved.wsl].filter(Boolean))];
+}
+
+// Walk `<home>/projects/<cwd-slug>/` for `<session-id>.jsonl` transcripts. The
+// sibling `<session-id>.checkpoints.jsonl` snapshot files carry no usage and
+// must never be parsed as transcripts.
+async function resolveCommandCodeSessionFiles(env = process.env, deps = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const home of resolveCommandCodeHomes(env, deps)) {
+    const projectsRoot = path.join(home, COMMAND_CODE_PROJECTS_DIR);
+    for (const project of await safeReadDir(projectsRoot)) {
+      if (!project.isDirectory()) continue;
+      const projectDir = path.join(projectsRoot, project.name);
+      for (const entry of await safeReadDir(projectDir)) {
+        if (!entry.isFile() || !isCommandCodeSessionLogName(entry.name)) continue;
+        const full = path.join(projectDir, entry.name);
+        if (seen.has(full)) continue;
+        seen.add(full);
+        out.push(full);
+      }
+    }
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
+// Row models are provider-qualified ("deepseek/deepseek-v4.1-flash"); the
+// pricing tables and bucket keys use the bare id, matching the dsh reader.
+function normalizeCommandCodeModelName(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const slash = trimmed.lastIndexOf("/");
+  const name = slash >= 0 ? trimmed.slice(slash + 1) : trimmed;
+  return name || null;
+}
+
+// Map Command Code's usage object onto disjoint queue columns. `inputTokens`
+// already includes the cache reads (see the section comment), so subtract them
+// back out first; returns null for an all-zero record. `costUsd` is the
+// provider-reported bill; zero keeps the repository-wide "unreported" sentinel
+// and falls through to model pricing on the read side.
+function commandCodeUsageToTotals(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const inclusiveInput = toNonNegativeInt(usage.inputTokens);
+  const cachedInput = toNonNegativeInt(usage.cacheReadTokens);
+  const cacheWrite = toNonNegativeInt(usage.cacheWriteTokens);
+  const output = toNonNegativeInt(usage.outputTokens);
+  const input = Math.max(0, inclusiveInput - cachedInput);
+  if (input === 0 && cachedInput === 0 && cacheWrite === 0 && output === 0) return null;
+  const total = input + cachedInput + cacheWrite + output;
+  const reportedCost = Number(usage.costUsd);
+  return {
+    input_tokens: input,
+    cached_input_tokens: cachedInput,
+    cache_creation_input_tokens: cacheWrite,
+    output_tokens: output,
+    reasoning_output_tokens: 0,
+    total_tokens: total,
+    billable_total_tokens: total,
+    total_cost_usd: Number.isFinite(reportedCost) && reportedCost > 0 ? reportedCost : 0,
+    conversation_count: 1,
+  };
+}
+
+// Read the top-level metadata of one transcript line. Message bodies are never
+// materialized: each field is sliced out of the raw text (findDshJsonProperty)
+// and only the small `usage` object is ever handed to JSON.parse — prompts,
+// replies and code are not allowed to reach this process (privacy rule in
+// CONTRIBUTING.md, asserted by the parser test's JSON.parse guard).
+function extractCommandCodeLine(line) {
+  const raw = String(line || "");
+  if (!raw.trim()) return null;
+  const type = parseDshJsonString(findDshJsonProperty(raw, "type"));
+  if (type === "session") {
+    return {
+      kind: "session",
+      sessionId: parseDshJsonString(findDshJsonProperty(raw, "id")),
+      cwd: parseDshJsonString(findDshJsonProperty(raw, "cwd")),
+    };
+  }
+  if (type !== "message") return null;
+  const id = parseDshJsonString(findDshJsonProperty(raw, "id"));
+  const timestamp = parseDshJsonString(findDshJsonProperty(raw, "timestamp"));
+  if (!id || !timestamp) return null;
+  const usageRaw = findDshJsonProperty(raw, "usage");
+  if (!usageRaw) return null;
+  let usage = null;
+  try {
+    usage = JSON.parse(usageRaw);
+  } catch (_error) {
+    return null;
+  }
+  const totals = commandCodeUsageToTotals(usage);
+  if (!totals) return null;
+  const bucketStart = toUtcHalfHourStart(timestamp);
+  if (!bucketStart) return null;
+  const model = normalizeCommandCodeModelName(
+    parseDshJsonString(findDshJsonProperty(raw, "model")),
+  );
+  return {
+    kind: "message",
+    id,
+    timestamp,
+    model: model || DEFAULT_MODEL,
+    totals,
+    bucketStart,
+  };
+}
+
+// Parse one transcript. A torn tail simply contributes nothing — the rebuild
+// reconciliation picks it up on the next sync once the record is complete.
+function extractCommandCodeSessionUsage(text) {
+  const records = [];
+  let sessionId = null;
+  let cwd = null;
+  for (const line of String(text || "").split("\n")) {
+    const parsed = extractCommandCodeLine(line);
+    if (!parsed) continue;
+    if (parsed.kind === "session") {
+      if (!sessionId && parsed.sessionId) sessionId = parsed.sessionId;
+      if (!cwd && parsed.cwd) cwd = parsed.cwd;
+      continue;
+    }
+    records.push(parsed);
+  }
+  return { sessionId, cwd, records };
+}
+
+function normalizeCommandCodeState(raw) {
+  const messages = {};
+  if (raw && typeof raw === "object" && raw.messages && typeof raw.messages === "object") {
+    for (const [key, value] of Object.entries(raw.messages)) {
+      if (!value || typeof value !== "object") continue;
+      if (!value.totals || !value.bucketStart || !value.model) continue;
+      messages[key] = value;
+    }
+  }
+  const files = {};
+  if (raw && typeof raw === "object" && raw.files && typeof raw.files === "object") {
+    for (const [key, value] of Object.entries(raw.files)) {
+      if (!value || typeof value !== "object") continue;
+      const size = Number(value.size);
+      const mtimeMs = Number(value.mtimeMs);
+      if (!Number.isFinite(size) || !Number.isFinite(mtimeMs)) continue;
+      files[key] = { size, mtimeMs };
+    }
+  }
+  return {
+    messages,
+    files,
+    updatedAt: typeof raw?.updatedAt === "string" ? raw.updatedAt : null,
+  };
+}
+
+// Rebuild-and-diff sync for `~/.commandcode/projects/**/*.jsonl`. A record's
+// identity is `sessionId|recordId`, so a rewritten transcript (resume /
+// compaction) reconciles instead of double counting, and a deleted session
+// stops contributing. Cursor state is committed only after both queue appends
+// succeed, so a failed write retries without losing or inflating usage.
+async function parseCommandCodeIncremental({
+  sessionFiles,
+  cursors,
+  queuePath,
+  projectQueuePath,
+  onProgress,
+  publicRepoResolver,
+} = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const files = Array.isArray(sessionFiles) ? sessionFiles : [];
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const state = normalizeCommandCodeState(cursors?.commandCode);
+  const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
+  const projectState = projectEnabled ? normalizeProjectState(cursors?.projectHourly) : null;
+  const projectTouchedBuckets = projectEnabled ? new Set() : null;
+  const projectMetaCache = projectEnabled ? new Map() : null;
+  const publicRepoCache = projectEnabled ? new Map() : null;
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+
+  const currentByKey = new Map();
+  const nextFiles = {};
+  let recordsProcessed = 0;
+
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const filePath = files[fileIdx];
+    let stat = null;
+    try {
+      stat = await fs.stat(filePath);
+    } catch (_error) {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    nextFiles[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs };
+
+    const prevFile = state.files[filePath];
+    const unchanged =
+      prevFile && prevFile.size === stat.size && prevFile.mtimeMs === stat.mtimeMs;
+    if (unchanged) {
+      // Seed the snapshot from the stored ledger: an unchanged file's records
+      // are already counted and must not diff as "disappeared".
+      for (const [key, value] of Object.entries(state.messages)) {
+        if (value?.filePath === filePath) currentByKey.set(key, value);
+      }
+      continue;
+    }
+
+    let raw;
+    try {
+      raw = await fs.readFile(filePath, "utf8");
+    } catch (_error) {
+      continue;
+    }
+    const parsed = extractCommandCodeSessionUsage(raw);
+    const sessionId = parsed.sessionId || path.basename(filePath, ".jsonl");
+
+    let projectKey = null;
+    let projectRef = null;
+    if (projectEnabled) {
+      const rawCwd = typeof parsed.cwd === "string" ? parsed.cwd.trim() : "";
+      if (rawCwd) {
+        const startDir = wsl.mapWslCwdToUnc(rawCwd, filePath);
+        const context = await resolveProjectContextForPath({
+          startDir,
+          projectMetaCache,
+          publicRepoCache,
+          publicRepoResolver,
+          projectState,
+        });
+        projectKey = context?.projectKey || null;
+        projectRef = context?.projectRef || null;
+      }
+    }
+
+    for (const record of parsed.records) {
+      recordsProcessed += 1;
+      currentByKey.set(`${COMMAND_CODE_SOURCE}:${sessionId}|${record.id}`, {
+        totals: record.totals,
+        bucketStart: record.bucketStart,
+        model: record.model,
+        projectKey,
+        projectRef,
+        filePath,
+      });
+    }
+
+    if (cb && (fileIdx % 25 === 0 || fileIdx === files.length - 1)) {
+      cb({
+        index: fileIdx + 1,
+        total: files.length,
+        messagesProcessed: currentByKey.size,
+        eventsAggregated: 0,
+        bucketsQueued: 0,
+      });
+    }
+  }
+
+  let eventsAggregated = 0;
+
+  // Subtract contributions that disappeared or changed.
+  for (const [key, prev] of Object.entries(state.messages)) {
+    const cur = currentByKey.get(key);
+    const unchanged =
+      cur &&
+      totalsKey(prev.totals) === totalsKey(cur.totals) &&
+      prev.bucketStart === cur.bucketStart &&
+      prev.model === cur.model &&
+      (prev.projectKey || null) === (cur.projectKey || null) &&
+      (prev.totals?.total_cost_usd || 0) === (cur.totals.total_cost_usd || 0);
+    if (unchanged) continue;
+    if (prev.totals && prev.bucketStart && prev.model) {
+      const oldBucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, prev.model, prev.bucketStart);
+      subtractTotals(oldBucket.totals, prev.totals);
+      touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, prev.model, prev.bucketStart));
+      if (projectEnabled && prev.projectKey) {
+        const oldProjectBucket = getProjectBucket(
+          projectState,
+          prev.projectKey,
+          COMMAND_CODE_SOURCE,
+          prev.bucketStart,
+          prev.projectRef || null,
+        );
+        subtractTotals(oldProjectBucket.totals, prev.totals);
+        projectTouchedBuckets.add(
+          projectBucketKey(prev.projectKey, COMMAND_CODE_SOURCE, prev.bucketStart),
+        );
+      }
+    }
+    if (cur) {
+      const bucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, cur.model, cur.bucketStart);
+      addTotals(bucket.totals, cur.totals);
+      touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, cur.model, cur.bucketStart));
+      if (projectEnabled && cur.projectKey) {
+        const projectBucket = getProjectBucket(
+          projectState,
+          cur.projectKey,
+          COMMAND_CODE_SOURCE,
+          cur.bucketStart,
+          cur.projectRef,
+        );
+        addTotals(projectBucket.totals, cur.totals);
+        projectTouchedBuckets.add(
+          projectBucketKey(cur.projectKey, COMMAND_CODE_SOURCE, cur.bucketStart),
+        );
+      }
+      state.messages[key] = {
+        totals: cur.totals,
+        conversationCount: cur.totals.conversation_count,
+        bucketStart: cur.bucketStart,
+        model: cur.model,
+        projectKey: cur.projectKey,
+        projectRef: cur.projectRef,
+        filePath: cur.filePath,
+        updatedAt: new Date().toISOString(),
+      };
+      eventsAggregated += 1;
+    } else {
+      delete state.messages[key];
+      eventsAggregated += 1;
+    }
+  }
+
+  // Add brand-new keys.
+  for (const [key, cur] of currentByKey.entries()) {
+    if (state.messages[key]) continue;
+    const bucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, cur.model, cur.bucketStart);
+    addTotals(bucket.totals, cur.totals);
+    touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, cur.model, cur.bucketStart));
+    if (projectEnabled && cur.projectKey) {
+      const projectBucket = getProjectBucket(
+        projectState,
+        cur.projectKey,
+        COMMAND_CODE_SOURCE,
+        cur.bucketStart,
+        cur.projectRef,
+      );
+      addTotals(projectBucket.totals, cur.totals);
+      projectTouchedBuckets.add(
+        projectBucketKey(cur.projectKey, COMMAND_CODE_SOURCE, cur.bucketStart),
+      );
+    }
+    state.messages[key] = {
+      totals: cur.totals,
+      conversationCount: cur.totals.conversation_count,
+      bucketStart: cur.bucketStart,
+      model: cur.model,
+      projectKey: cur.projectKey,
+      projectRef: cur.projectRef,
+      filePath: cur.filePath,
+      updatedAt: new Date().toISOString(),
+    };
+    eventsAggregated += 1;
+  }
+
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const projectBucketsQueued = projectEnabled
+    ? await enqueueTouchedProjectBuckets({ projectQueuePath, projectState, projectTouchedBuckets })
+    : 0;
+
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  state.updatedAt = updatedAt;
+  state.files = nextFiles;
+  cursors.hourly = hourlyState;
+  cursors.commandCode = state;
+  if (projectState) {
+    projectState.updatedAt = updatedAt;
+    cursors.projectHourly = projectState;
+  }
+
+  return {
+    recordsProcessed,
+    messagesProcessed: currentByKey.size,
+    eventsAggregated,
+    bucketsQueued,
+    projectBucketsQueued,
+  };
+}
+
 module.exports = {
   listRolloutFiles,
   listRolloutFilesDeep,
@@ -23250,4 +23707,13 @@ module.exports = {
   dshUsageToTotals,
   extractDshSessionUsage,
   parseDshIncremental,
+  // Command Code (`cmd`) — passive session-log reader
+  resolveCommandCodeHome,
+  resolveCommandCodeHomes,
+  resolveCommandCodeSessionFiles,
+  isCommandCodeSessionLogName,
+  normalizeCommandCodeModelName,
+  commandCodeUsageToTotals,
+  extractCommandCodeSessionUsage,
+  parseCommandCodeIncremental,
 };
