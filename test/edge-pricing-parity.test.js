@@ -274,7 +274,7 @@ test("all cloud cost paths only prefer provider-reported costs for authoritative
     assert.ok(source.includes("reportedCost"), `${name}: reported cost branch missing`);
     assert.match(
       source,
-      /const SOURCES_WITH_AUTHORITATIVE_COST = new Set\(\["grok"\]\);/,
+      /const SOURCES_WITH_AUTHORITATIVE_COST = new Set\(\["grok", "command-code"\]\);/,
       `${name}: authoritative cost sources must be explicitly allowlisted`,
     );
     assert.match(
