@@ -23253,6 +23253,36 @@ function normalizeCommandCodeState(raw) {
   };
 }
 
+// Snapshot one transcript through a single descriptor: the change check and the
+// read share one handle, so a writer cannot swap the file between them (the
+// TOCTOU shape CodeQL reports as js/file-system-race). Returns null for a
+// missing or non-file path so callers treat it as a no-op.
+async function readCommandCodeSessionSnapshot(filePath, previous = null) {
+  const handle = await fs.open(filePath, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    const stat = await handle.stat().catch(() => null);
+    if (!stat || !stat.isFile()) return null;
+    const metadata = { size: stat.size, mtimeMs: stat.mtimeMs };
+    if (
+      previous &&
+      previous.size === metadata.size &&
+      previous.mtimeMs === metadata.mtimeMs
+    ) {
+      return { ...metadata, unchanged: true, text: null };
+    }
+    const data = await handle.readFile();
+    const finalStat = await handle.stat().catch(() => stat);
+    const finalMetadata = { size: finalStat.size, mtimeMs: finalStat.mtimeMs };
+    // A writer that appended while this handle was being read must be retried
+    // on the next sync instead of acknowledging a tail that was never parsed.
+    if (finalMetadata.size !== data.length) finalMetadata.mtimeMs = -1;
+    return { ...finalMetadata, unchanged: false, text: data.toString("utf8") };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 // Rebuild-and-diff sync for `~/.commandcode/projects/**/*.jsonl`. A record's
 // identity is `sessionId|recordId`, so a rewritten transcript (resume /
 // compaction) reconciles instead of double counting, and a deleted session
@@ -23284,19 +23314,11 @@ async function parseCommandCodeIncremental({
 
   for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
     const filePath = files[fileIdx];
-    let stat = null;
-    try {
-      stat = await fs.stat(filePath);
-    } catch (_error) {
-      continue;
-    }
-    if (!stat.isFile()) continue;
-    nextFiles[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs };
+    const snapshot = await readCommandCodeSessionSnapshot(filePath, state.files[filePath] || null);
+    if (!snapshot) continue;
+    nextFiles[filePath] = { size: snapshot.size, mtimeMs: snapshot.mtimeMs };
 
-    const prevFile = state.files[filePath];
-    const unchanged =
-      prevFile && prevFile.size === stat.size && prevFile.mtimeMs === stat.mtimeMs;
-    if (unchanged) {
+    if (snapshot.unchanged) {
       // Seed the snapshot from the stored ledger: an unchanged file's records
       // are already counted and must not diff as "disappeared".
       for (const [key, value] of Object.entries(state.messages)) {
@@ -23305,13 +23327,7 @@ async function parseCommandCodeIncremental({
       continue;
     }
 
-    let raw;
-    try {
-      raw = await fs.readFile(filePath, "utf8");
-    } catch (_error) {
-      continue;
-    }
-    const parsed = extractCommandCodeSessionUsage(raw);
+    const parsed = extractCommandCodeSessionUsage(snapshot.text);
     const sessionId = parsed.sessionId || path.basename(filePath, ".jsonl");
 
     let projectKey = null;
