@@ -1656,7 +1656,9 @@ async function cmdSync(argv, context = {}) {
     if (sourceAllowed("command-code")) {
       try {
         const commandCodeSessionFiles = await resolveCommandCodeSessionFiles(process.env);
-        if (commandCodeSessionFiles.length > 0) {
+        // A successful empty discovery still retracts a previous ledger. I/O
+        // failures throw above and leave that provider's state retryable.
+        if (commandCodeSessionFiles.length > 0 || cursors.commandCode) {
           if (progress?.enabled) {
             progress.start(
               `Parsing Command Code ${renderBar(0)} 0/${formatNumber(
@@ -3142,6 +3144,7 @@ async function cmdSync(argv, context = {}) {
       totalParsed === 0 &&
       totalBuckets === 0 &&
       !(grokResult.projectBucketsQueued > 0) &&
+      !(commandCodeResult.projectBucketsQueued > 0) &&
       !codexColdAuditDue &&
       !codexFallbackRetryRan &&
       !grokHookSignalConsumed &&

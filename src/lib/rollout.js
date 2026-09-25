@@ -23089,10 +23089,12 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 // file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
 // per-file snapshot and reconciles it against a subtract-on-change ledger keyed
 // by `sessionId|recordId` — the shape the Qoder-new reader uses. Files whose
-// (size, mtime) pair is unchanged under the current accounting version are not
-// re-read.
+// (size, mtime) pair is unchanged can reuse their owned ledger records. A
+// non-owning duplicate is re-read rather than storing a second full ledger.
 const COMMAND_CODE_SOURCE = "command-code";
 const COMMAND_CODE_STATE_VERSION = 1;
+const COMMAND_CODE_FILE_CACHE_VERSION = 1;
+const COMMAND_CODE_HEADER_MAX_BYTES = 65536;
 const COMMAND_CODE_HOME_DIR = ".commandcode";
 const COMMAND_CODE_PROJECTS_DIR = "projects";
 
@@ -23123,16 +23125,25 @@ function resolveCommandCodeHomes(env = process.env, deps = {}) {
   const platform = deps.platform || process.platform;
   if (overridden || platform !== "win32") return [nativeHome];
 
-  const existsSync = deps.existsSync || fssync.existsSync;
-  let nativeValue = null;
-  try {
-    if (existsSync(nativeHome)) nativeValue = nativeHome;
-  } catch (_error) {}
+  // existsSync hides permission/sharing failures as absence. Capture those
+  // failures even when the shared WSL discovery helper swallows its probes.
+  const probePath = deps.existsSync || ((candidate) => fssync.statSync(candidate).isDirectory());
+  let probeError = null;
+  const existsSync = (candidate) => {
+    try {
+      return probePath(candidate);
+    } catch (error) {
+      if (!isCommandCodePathMissing(error) && !probeError) probeError = error;
+      return false;
+    }
+  };
+  const nativeValue = wsl.shouldProbeNative(env) && existsSync(nativeHome) ? nativeHome : null;
 
   const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
   const wslValue = wsl.shouldProbeWsl(env)
-    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env })
+    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env, existsSync })
     : null;
+  if (probeError) throw probeError;
   const resolved = wsl.resolveAllWin32Paths({
     nativeValue,
     wslValue,
@@ -23150,10 +23161,10 @@ async function resolveCommandCodeSessionFiles(env = process.env, deps = {}) {
   const seen = new Set();
   for (const home of resolveCommandCodeHomes(env, deps)) {
     const projectsRoot = path.join(home, COMMAND_CODE_PROJECTS_DIR);
-    for (const project of await safeReadDir(projectsRoot)) {
+    for (const project of await readCommandCodeDirectory(projectsRoot)) {
       if (!project.isDirectory()) continue;
       const projectDir = path.join(projectsRoot, project.name);
-      for (const entry of await safeReadDir(projectDir)) {
+      for (const entry of await readCommandCodeDirectory(projectDir)) {
         if (!entry.isFile() || !isCommandCodeSessionLogName(entry.name)) continue;
         const full = path.join(projectDir, entry.name);
         if (seen.has(full)) continue;
@@ -23164,6 +23175,20 @@ async function resolveCommandCodeSessionFiles(env = process.env, deps = {}) {
   }
   out.sort((a, b) => a.localeCompare(b));
   return out;
+}
+
+function isCommandCodePathMissing(error) {
+  return error?.code === "ENOENT" || error?.code === "ENOTDIR" || error?.code === "EISDIR";
+}
+
+async function readCommandCodeDirectory(directory) {
+  try {
+    return await fs.readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (isCommandCodePathMissing(error)) return [];
+    // An incomplete discovery must not reconcile inaccessible roots as empty.
+    throw error;
+  }
 }
 
 // Row models are provider-qualified ("deepseek/deepseek-v4.1-flash"); the
@@ -23254,19 +23279,26 @@ function extractCommandCodeLine(line) {
 // reconciliation picks it up on the next sync once the record is complete.
 function extractCommandCodeSessionUsage(text) {
   const records = [];
+  const headerRanges = [];
   let sessionId = null;
   let cwd = null;
+  let byteOffset = 0;
   for (const line of String(text || "").split("\n")) {
+    const length = Buffer.byteLength(line);
+    const start = byteOffset;
+    byteOffset += length + 1;
     const parsed = extractCommandCodeLine(line);
     if (!parsed) continue;
     if (parsed.kind === "session") {
+      const headerLength = Buffer.byteLength(line.trimStart());
+      headerRanges.push({ start: start + length - headerLength, length: headerLength });
       if (!sessionId && parsed.sessionId) sessionId = parsed.sessionId;
       if (!cwd && parsed.cwd) cwd = parsed.cwd;
       continue;
     }
     records.push(parsed);
   }
-  return { sessionId, cwd, records };
+  return { sessionId, cwd, records, headerRanges };
 }
 
 function normalizeCommandCodeState(raw) {
@@ -23293,10 +23325,34 @@ function normalizeCommandCodeState(raw) {
       files[key] = { size, mtimeMs };
     }
   }
+  const fileIndex = {};
+  // Accounting-v1 fingerprints alone do not prove a complete file snapshot.
+  // Missing/older indexes force one reread while retaining the old ledger for
+  // subtraction, including caches whose surviving duplicate was retracted.
+  if (raw?.fileCacheVersion === COMMAND_CODE_FILE_CACHE_VERSION && raw.fileIndex) {
+    for (const [key, value] of Object.entries(raw.fileIndex)) {
+      if (!files[key] || !Array.isArray(value?.messageKeys) || !Array.isArray(value.headerRanges)) continue;
+      if (value.messageKeys.some((entry) => typeof entry !== "string")) continue;
+      let end = 0;
+      const validRanges = value.headerRanges.every((range) => {
+        if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range.length)) return false;
+        if (range.start < end || range.length < 0 || range.start + range.length > files[key].size) return false;
+        end = range.start + range.length;
+        return true;
+      });
+      if (!validRanges) continue;
+      fileIndex[key] = {
+        messageKeys: [...new Set(value.messageKeys)],
+        headerRanges: value.headerRanges.map(({ start, length }) => ({ start, length })),
+      };
+    }
+  }
   return {
     version: COMMAND_CODE_STATE_VERSION,
+    fileCacheVersion: COMMAND_CODE_FILE_CACHE_VERSION,
     messages,
     files,
+    fileIndex,
     updatedAt: typeof raw?.updatedAt === "string" ? raw.updatedAt : null,
   };
 }
@@ -23304,30 +23360,57 @@ function normalizeCommandCodeState(raw) {
 // Snapshot one transcript through a single descriptor: the change check and the
 // read share one handle, so a writer cannot swap the file between them (the
 // TOCTOU shape CodeQL reports as js/file-system-race). Returns null for a
-// missing or non-file path so callers treat it as a no-op.
-async function readCommandCodeSessionSnapshot(filePath, previous = null) {
-  const handle = await fs.open(filePath, "r").catch(() => null);
-  if (!handle) return null;
+// missing or non-file path so reconciliation can retract it. Other observation
+// failures propagate before any queues or cursors are published.
+async function readCommandCodeSessionSnapshot(filePath, previous = null, headerRanges = null) {
+  let handle;
   try {
-    const stat = await handle.stat().catch(() => null);
-    if (!stat || !stat.isFile()) return null;
+    handle = await fs.open(filePath, "r");
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
     const metadata = { size: stat.size, mtimeMs: stat.mtimeMs };
     if (
       previous &&
       previous.size === metadata.size &&
-      previous.mtimeMs === metadata.mtimeMs
+      previous.mtimeMs === metadata.mtimeMs &&
+      (!headerRanges || headerRanges.reduce((sum, range) => sum + range.length, 0) <= COMMAND_CODE_HEADER_MAX_BYTES)
     ) {
-      return { ...metadata, unchanged: true, text: null };
+      if (!headerRanges) return { ...metadata, unchanged: true, text: null };
+      // Store byte ranges, never cwd. Positional reads through this same handle
+      // refresh only header lines, preserving Unicode and leading whitespace
+      // without materializing any of the cached message bodies.
+      const headers = [];
+      let complete = true;
+      for (const { start, length } of headerRanges) {
+        const data = Buffer.alloc(length);
+        let offset = 0;
+        while (offset < length) {
+          const { bytesRead } = await handle.read(data, offset, length - offset, start + offset);
+          if (!bytesRead) { complete = false; break; }
+          offset += bytesRead;
+        }
+        if (!complete) break;
+        headers.push(data.toString("utf8"));
+      }
+      const finalStat = await handle.stat();
+      if (complete && finalStat.size === stat.size && finalStat.mtimeMs === stat.mtimeMs) {
+        return { ...metadata, unchanged: true, text: headers.join("\n") };
+      }
+      // The file changed during the header read. Rebuild through this handle;
+      // positional reads above did not advance its full-read file position.
     }
     const data = await handle.readFile();
-    const finalStat = await handle.stat().catch(() => stat);
+    const finalStat = await handle.stat();
     const finalMetadata = { size: finalStat.size, mtimeMs: finalStat.mtimeMs };
     // A writer that appended while this handle was being read must be retried
     // on the next sync instead of acknowledging a tail that was never parsed.
     if (finalMetadata.size !== data.length) finalMetadata.mtimeMs = -1;
     return { ...finalMetadata, unchanged: false, text: data.toString("utf8") };
+  } catch (error) {
+    if (isCommandCodePathMissing(error)) return null;
+    throw error;
   } finally {
-    await handle.close().catch(() => {});
+    if (handle) await handle.close().catch(() => {});
   }
 }
 
@@ -23363,22 +23446,20 @@ async function parseCommandCodeIncremental({
 
   const currentByKey = new Map();
   const nextFiles = {};
+  const nextFileIndex = {};
   let recordsProcessed = 0;
 
   for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
     const filePath = files[fileIdx];
-    const snapshot = await readCommandCodeSessionSnapshot(filePath, state.files[filePath] || null);
+    const index = state.fileIndex[filePath];
+    const ownsSnapshot = index && index.messageKeys.every((key) => state.messages[key]?.filePath === filePath);
+    const snapshot = await readCommandCodeSessionSnapshot(
+      filePath,
+      ownsSnapshot ? state.files[filePath] : null,
+      projectEnabled && ownsSnapshot ? index.headerRanges : null,
+    );
     if (!snapshot) continue;
     nextFiles[filePath] = { size: snapshot.size, mtimeMs: snapshot.mtimeMs };
-
-    if (snapshot.unchanged) {
-      // Seed the snapshot from the stored ledger: an unchanged file's records
-      // are already counted and must not diff as "disappeared".
-      for (const [key, value] of Object.entries(state.messages)) {
-        if (value?.filePath === filePath) currentByKey.set(key, value);
-      }
-      continue;
-    }
 
     const parsed = extractCommandCodeSessionUsage(snapshot.text);
     const sessionId = parsed.sessionId || path.basename(filePath, ".jsonl");
@@ -23401,9 +23482,21 @@ async function parseCommandCodeIncremental({
       }
     }
 
+    if (snapshot.unchanged) {
+      nextFileIndex[filePath] = index;
+      for (const key of index.messageKeys) {
+        const value = state.messages[key];
+        currentByKey.set(key, projectEnabled ? { ...value, projectKey, projectRef } : value);
+      }
+      continue;
+    }
+
+    const messageKeys = new Set();
     for (const record of parsed.records) {
       recordsProcessed += 1;
-      currentByKey.set(`${COMMAND_CODE_SOURCE}:${sessionId}|${record.id}`, {
+      const key = `${COMMAND_CODE_SOURCE}:${sessionId}|${record.id}`;
+      messageKeys.add(key);
+      currentByKey.set(key, {
         totals: record.totals,
         bucketStart: record.bucketStart,
         model: record.model,
@@ -23412,6 +23505,7 @@ async function parseCommandCodeIncremental({
         filePath,
       });
     }
+    nextFileIndex[filePath] = { messageKeys: [...messageKeys], headerRanges: parsed.headerRanges };
 
     if (cb && (fileIdx % 25 === 0 || fileIdx === files.length - 1)) {
       cb({
@@ -23436,7 +23530,12 @@ async function parseCommandCodeIncremental({
       prev.model === cur.model &&
       (prev.projectKey || null) === (cur.projectKey || null) &&
       (prev.totals?.total_cost_usd || 0) === (cur.totals.total_cost_usd || 0);
-    if (unchanged) continue;
+    if (unchanged) {
+      // A move or surviving duplicate can have identical totals but a new
+      // canonical owner. Persist that provenance for the next unchanged scan.
+      state.messages[key] = { ...prev, filePath: cur.filePath, projectRef: cur.projectRef };
+      continue;
+    }
     if (prev.totals && prev.bucketStart && prev.model) {
       const oldBucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, prev.model, prev.bucketStart);
       subtractTotals(oldBucket.totals, prev.totals);
@@ -23530,6 +23629,7 @@ async function parseCommandCodeIncremental({
   hourlyState.updatedAt = updatedAt;
   state.updatedAt = updatedAt;
   state.files = nextFiles;
+  state.fileIndex = nextFileIndex;
   cursors.hourly = hourlyState;
   cursors.commandCode = state;
   if (projectState) {

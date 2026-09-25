@@ -25,6 +25,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { computeRowCost } = require("../src/lib/pricing");
@@ -797,4 +798,643 @@ test("parseCommandCodeIncremental is a no-op with no files", async () => {
   assert.equal(result.eventsAggregated, 0);
   assert.equal(result.bucketsQueued, 0);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const LIFECYCLE_TOTALS = {
+  input_tokens: 1000,
+  cached_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+  output_tokens: 100,
+  reasoning_output_tokens: 0,
+  total_tokens: 1100,
+  billable_total_tokens: 1100,
+  total_cost_usd: 0.42,
+  conversation_count: 1,
+};
+const LIFECYCLE_ROW = {
+  source: "command-code",
+  model: "deepseek-v4.1-flash",
+  hour_start: T0,
+  ...LIFECYCLE_TOTALS,
+};
+const LIFECYCLE_KEY = `command-code:sess-lifecycle|m1`;
+
+function makeLifecycleTree({ remote = true, prefix = "", message = null } = {}) {
+  const tree = makeTree({ sessionId: "sess-lifecycle" });
+  const repoDir = path.join(tree.dir, "synthetic-project-项目");
+  fs.mkdirSync(repoDir);
+  if (remote) writeLifecycleRemote(repoDir, "acme/lifecycle-fixture");
+  const header = `${prefix}${headerLine("sess-lifecycle", repoDir)}\r\n`;
+  fs.writeFileSync(tree.filePath, `${header}${messageLine({ id: "m1", costUsd: 0.42, message })}\n`);
+  return {
+    ...tree,
+    repoDir,
+    headerBytes: Buffer.byteLength(header),
+    options: {
+      sessionFiles: [tree.filePath],
+      cursors: {},
+      queuePath: path.join(tree.dir, "queue.jsonl"),
+      projectQueuePath: path.join(tree.dir, "project.queue.jsonl"),
+    },
+  };
+}
+
+function writeLifecycleRemote(repoDir, projectKey) {
+  fs.mkdirSync(path.join(repoDir, ".git"), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, ".git", "config"),
+    `[remote "origin"]\n\turl = https://github.com/${projectKey}.git\n`);
+}
+
+function latestCommandCodeProjectRows(queuePath) {
+  return new Map(commandCodeRows(queuePath).map((row) => [
+    `${row.project_key}|${row.hour_start}`, row,
+  ]));
+}
+
+function lifecycleProjectRow(projectKey = "acme/lifecycle-fixture", totals = LIFECYCLE_TOTALS) {
+  return {
+    project_key: projectKey,
+    project_ref: `https://github.com/${projectKey}`,
+    source: "command-code",
+    hour_start: T0,
+    ...totals,
+  };
+}
+
+function roundTripLifecycleCursors(options) {
+  options.cursors = JSON.parse(JSON.stringify(options.cursors));
+}
+
+for (const removedIndex of [0, 1]) {
+  test(`Command Code keeps a duplicate's 1100 tokens after deleting copy ${removedIndex + 1}`, async () => {
+    const { dir, filePath, options } = makeLifecycleTree();
+    const duplicate = path.join(path.dirname(filePath), "duplicate.jsonl");
+    fs.copyFileSync(filePath, duplicate);
+    options.sessionFiles = [filePath, duplicate];
+    try {
+      await parseCommandCodeIncremental(options);
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+      fs.unlinkSync(options.sessionFiles[removedIndex]);
+      options.sessionFiles.splice(removedIndex, 1);
+      roundTripLifecycleCursors(options);
+
+      await parseCommandCodeIncremental(options);
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+      assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, options.sessionFiles[0]);
+      roundTripLifecycleCursors(options);
+
+      const repeat = await parseCommandCodeIncremental(options);
+      assert.equal(repeat.recordsProcessed, 0);
+      assert.equal(repeat.eventsAggregated, 0);
+      assert.equal(repeat.bucketsQueued, 0);
+      assert.equal(repeat.projectBucketsQueued, 0);
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("Command Code refreshes moved-file provenance even when accounting does not change", async () => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  const moved = path.join(path.dirname(filePath), "moved.jsonl");
+  try {
+    await parseCommandCodeIncremental(options);
+    fs.renameSync(filePath, moved);
+    options.sessionFiles = [moved];
+    roundTripLifecycleCursors(options);
+    const move = await parseCommandCodeIncremental(options);
+    assert.equal(move.bucketsQueued, 0);
+    assert.equal(move.projectBucketsQueued, 0);
+    assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, moved);
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code recovers version-1 file fingerprints with no new cache metadata", async () => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  const duplicate = path.join(path.dirname(filePath), "duplicate.jsonl");
+  fs.copyFileSync(filePath, duplicate);
+  options.sessionFiles = [filePath, duplicate];
+  try {
+    await parseCommandCodeIncremental(options);
+    const old = options.cursors.commandCode;
+    // The deployed accounting-v1 format has no per-file ownership/header index.
+    options.cursors.commandCode = {
+      version: 1, messages: old.messages, files: old.files, updatedAt: old.updatedAt,
+    };
+    fs.unlinkSync(duplicate);
+    options.sessionFiles = [filePath];
+    roundTripLifecycleCursors(options);
+    const recovered = await parseCommandCodeIncremental(options);
+    assert.equal(recovered.recordsProcessed, 1, "old fingerprints must be reread once");
+    assert.equal(options.cursors.commandCode.version, 1, "the accounting version is unchanged");
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code rereads an already-retracted version-1 survivor instead of keeping a poisoned cache", async () => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  try {
+    const zero = Object.fromEntries(Object.keys(LIFECYCLE_TOTALS).map((key) => [key, 0]));
+    const { size, mtimeMs } = fs.statSync(filePath);
+    options.cursors = {
+      commandCode: { version: 1, messages: {}, files: { [filePath]: { size, mtimeMs } } },
+    };
+    fs.writeFileSync(options.queuePath, JSON.stringify({ ...LIFECYCLE_ROW, ...zero }) + "\n");
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...zero }, LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.bucketsQueued, 0);
+    assert.deepEqual(commandCodeRows(options.queuePath).at(-1), LIFECYCLE_ROW);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code restores a differing duplicate when the winning transcript is compacted", async () => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree();
+  const winner = path.join(path.dirname(filePath), "winner.jsonl");
+  fs.writeFileSync(winner, `${headerLine("sess-lifecycle", repoDir)}\n${messageLine({
+    id: "m1", inputTokens: 2000, outputTokens: 200, costUsd: 0.84,
+  })}\n`);
+  options.sessionFiles = [filePath, winner];
+  try {
+    await parseCommandCodeIncremental(options);
+    const winningTotals = {
+      ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84,
+    };
+    assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...winningTotals }]);
+    roundTripLifecycleCursors(options);
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...winningTotals }]);
+
+    fs.writeFileSync(winner, headerLine("sess-lifecycle", repoDir) + "\n");
+    roundTripLifecycleCursors(options);
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...winningTotals }, LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [
+      lifecycleProjectRow("acme/lifecycle-fixture", winningTotals), lifecycleProjectRow(),
+    ]);
+    assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, filePath);
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+    assert.deepEqual(commandCodeRows(options.queuePath).at(-1), LIFECYCLE_ROW);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [operation, code] of [
+  ["open", "EACCES"], ["open", "EPERM"], ["open", "EIO"],
+  ["stat", "EACCES"], ["final-stat", "EIO"], ["readFile", "EIO"],
+]) {
+  test(`Command Code propagates ${operation} ${code} without changing either queue or any cursor`, async () => {
+    const { dir, filePath, options } = makeLifecycleTree();
+    const originalOpen = fsp.open;
+    try {
+      await parseCommandCodeIncremental(options);
+      const before = JSON.parse(JSON.stringify(options.cursors));
+      const beforeHourly = fs.readFileSync(options.queuePath);
+      const beforeProject = fs.readFileSync(options.projectQueuePath);
+      fs.appendFileSync(filePath, messageLine({ id: "m2", costUsd: 0.42 }) + "\n");
+      const injected = Object.assign(new Error(`synthetic ${operation} failure`), { code });
+      fsp.open = async function (file, ...args) {
+        if (file !== filePath) return originalOpen.call(this, file, ...args);
+        if (operation === "open") throw injected;
+        const handle = await originalOpen.call(this, file, ...args);
+        const method = operation === "readFile" ? "readFile" : "stat";
+        const originalMethod = handle[method].bind(handle);
+        let calls = 0;
+        handle[method] = async (...methodArgs) => {
+          calls += 1;
+          if (operation !== "final-stat" || calls === 2) throw injected;
+          return originalMethod(...methodArgs);
+        };
+        return handle;
+      };
+      await assert.rejects(parseCommandCodeIncremental(options), (error) => error === injected);
+      assert.deepEqual(options.cursors, before, "all cursor state stays failure-atomic");
+      assert.deepEqual(fs.readFileSync(options.queuePath), beforeHourly);
+      assert.deepEqual(fs.readFileSync(options.projectQueuePath), beforeProject);
+      fsp.open = originalOpen;
+
+      await parseCommandCodeIncremental(options);
+      const recoveredTotals = {
+        ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
+        total_tokens: 2200, billable_total_tokens: 2200,
+        total_cost_usd: 0.84, conversation_count: 2,
+      };
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...recoveredTotals }]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [
+        lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", recoveredTotals),
+      ]);
+      roundTripLifecycleCursors(options);
+      const repeat = await parseCommandCodeIncremental(options);
+      assert.equal(repeat.recordsProcessed, 0);
+      assert.equal(repeat.bucketsQueued, 0);
+      assert.equal(repeat.projectBucketsQueued, 0);
+    } finally {
+      fsp.open = originalOpen;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const replacement of ["missing", "directory"]) {
+  test(`Command Code treats a confirmed ${replacement} transcript as deleted`, async () => {
+    const { dir, filePath, options } = makeLifecycleTree();
+    try {
+      await parseCommandCodeIncremental(options);
+      fs.unlinkSync(filePath);
+      if (replacement === "directory") fs.mkdirSync(filePath);
+      await parseCommandCodeIncremental(options);
+      const zero = Object.fromEntries(Object.keys(LIFECYCLE_TOTALS).map((key) => [key, 0]));
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...zero }]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", zero)]);
+      assert.deepEqual(options.cursors.commandCode.messages, {});
+      roundTripLifecycleCursors(options);
+      const repeat = await parseCommandCodeIncremental(options);
+      assert.equal(repeat.eventsAggregated, 0);
+      assert.equal(repeat.bucketsQueued, 0);
+      assert.equal(repeat.projectBucketsQueued, 0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const [level, code] of [["root", "EACCES"], ["project", "EPERM"], ["root", "EIO"]]) {
+  test(`Command Code discovery propagates ${level} ${code} instead of returning an empty scan`, async () => {
+    const { dir, home, projectDir, filePath } = makeTree();
+    const originalReadDir = fsp.readdir;
+    const failedPath = level === "root" ? path.join(home, "projects") : projectDir;
+    const injected = Object.assign(new Error("synthetic discovery failure"), { code });
+    const env = { TOKENTRACKER_COMMANDCODE_HOME: home };
+    try {
+      fsp.readdir = async function (file, ...args) {
+        if (file === failedPath) throw injected;
+        return originalReadDir.call(this, file, ...args);
+      };
+      await assert.rejects(resolveCommandCodeSessionFiles(env), (error) => error === injected);
+      fsp.readdir = originalReadDir;
+      assert.deepEqual(await resolveCommandCodeSessionFiles(env), [filePath]);
+      assert.deepEqual(await resolveCommandCodeSessionFiles({
+        TOKENTRACKER_COMMANDCODE_HOME: path.join(dir, "missing"),
+      }), []);
+    } finally {
+      fsp.readdir = originalReadDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("Command Code refreshes Unicode/whitespace-prefixed project headers through the same bounded descriptor", async () => {
+  const secret = "SYNTHETIC_BODY_NOT_NEEDED_FOR_PROJECT_REFRESH";
+  const { dir, filePath, repoDir, headerBytes, options } = makeLifecycleTree({
+    remote: false, prefix: " \t\r\n\r\n  ", message: secret.repeat(4096),
+  });
+  const originalOpen = fsp.open;
+  const originalStat = fsp.stat;
+  try {
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), []);
+    const initialStat = fs.statSync(filePath);
+    const hourlyBytes = fs.readFileSync(options.queuePath);
+    let opens = 0;
+    let headerReadBytes = 0;
+    let stats = 0;
+    fsp.open = async function (file, ...args) {
+      const handle = await originalOpen.call(this, file, ...args);
+      if (file !== filePath) return handle;
+      opens += 1;
+      const read = handle.read.bind(handle);
+      const stat = handle.stat.bind(handle);
+      handle.readFile = async () => assert.fail("unchanged message bodies must not be reread");
+      handle.stat = async (...statArgs) => { stats += 1; return stat(...statArgs); };
+      handle.read = async (...readArgs) => {
+        const result = await read(...readArgs);
+        headerReadBytes += result.bytesRead;
+        assert.equal(result.buffer.toString("utf8").includes(secret), false);
+        return result;
+      };
+      return handle;
+    };
+    fsp.stat = async function (file, ...args) {
+      assert.notEqual(file, filePath, "transcript stat must share its read descriptor");
+      return originalStat.call(this, file, ...args);
+    };
+    writeLifecycleRemote(repoDir, "acme/lifecycle-fixture");
+    roundTripLifecycleCursors(options);
+    const refreshed = await parseCommandCodeIncremental(options);
+    assert.equal(refreshed.recordsProcessed, 0);
+    assert.equal(refreshed.eventsAggregated, 1);
+    assert.equal(refreshed.bucketsQueued, 0);
+    assert.equal(refreshed.projectBucketsQueued, 1);
+    assert.equal(opens, 1);
+    assert.ok(stats >= 1);
+    assert.ok(headerReadBytes > 0 && headerReadBytes <= headerBytes, "only the header byte range is read");
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+    const currentStat = fs.statSync(filePath);
+    assert.equal(currentStat.size, initialStat.size);
+    assert.equal(currentStat.mtimeMs, initialStat.mtimeMs);
+    const persistedStrings = [];
+    function collectStrings(value) {
+      if (typeof value === "string") persistedStrings.push(value);
+      else if (value && typeof value === "object") Object.values(value).forEach(collectStrings);
+    }
+    collectStrings(options.cursors);
+    assert.equal(persistedStrings.some((value) => value.includes(repoDir) || value.includes(secret)), false,
+      "neither raw cwd nor message body is persisted");
+
+    writeLifecycleRemote(repoDir, "acme/another-lifecycle-fixture");
+    roundTripLifecycleCursors(options);
+    const changedRemote = await parseCommandCodeIncremental(options);
+    assert.equal(changedRemote.recordsProcessed, 0);
+    assert.equal(changedRemote.bucketsQueued, 0);
+    assert.equal(changedRemote.projectBucketsQueued, 2);
+    const zero = Object.fromEntries(Object.keys(LIFECYCLE_TOTALS).map((key) => [key, 0]));
+    const projects = latestCommandCodeProjectRows(options.projectQueuePath);
+    assert.deepEqual(projects, new Map([
+      [`acme/lifecycle-fixture|${T0}`, lifecycleProjectRow("acme/lifecycle-fixture", zero)],
+      [`acme/another-lifecycle-fixture|${T0}`, lifecycleProjectRow("acme/another-lifecycle-fixture")],
+    ]));
+    const projectBytes = fs.readFileSync(options.projectQueuePath);
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+    assert.equal(repeat.projectBucketsQueued, 0);
+    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+    assert.deepEqual(fs.readFileSync(options.projectQueuePath), projectBytes);
+  } finally {
+    fsp.open = originalOpen;
+    fsp.stat = originalStat;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code propagates an unchanged-header read error without publishing project refresh", async () => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree();
+  const originalOpen = fsp.open;
+  try {
+    await parseCommandCodeIncremental(options);
+    const before = JSON.parse(JSON.stringify(options.cursors));
+    const hourlyBytes = fs.readFileSync(options.queuePath);
+    const projectBytes = fs.readFileSync(options.projectQueuePath);
+    writeLifecycleRemote(repoDir, "acme/another-lifecycle-fixture");
+    const injected = Object.assign(new Error("synthetic header failure"), { code: "EPERM" });
+    fsp.open = async function (file, ...args) {
+      const handle = await originalOpen.call(this, file, ...args);
+      if (file === filePath) handle.read = async () => { throw injected; };
+      return handle;
+    };
+    await assert.rejects(parseCommandCodeIncremental(options), (error) => error === injected);
+    assert.deepEqual(options.cursors, before);
+    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+    assert.deepEqual(fs.readFileSync(options.projectQueuePath), projectBytes);
+    fsp.open = originalOpen;
+    const recovered = await parseCommandCodeIncremental(options);
+    assert.equal(recovered.projectBucketsQueued, 2);
+    assert.deepEqual(latestCommandCodeProjectRows(options.projectQueuePath).get(
+      `acme/another-lifecycle-fixture|${T0}`), lifecycleProjectRow("acme/another-lifecycle-fixture"));
+    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+  } finally {
+    fsp.open = originalOpen;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const probe of ["native", "wsl"]) {
+  test(`Command Code rejects an incomplete Windows ${probe} home probe`, () => {
+    const nativeHome = "C:\\synthetic\\.commandcode";
+    const wslHome = "\\\\wsl$\\Synthetic\\home\\fixture\\.commandcode";
+    const injected = Object.assign(new Error("synthetic home-probe failure"), { code: "EACCES" });
+    const deps = {
+      platform: "win32",
+      nativeHome,
+      existsSync(candidate) {
+        if (candidate === (probe === "native" ? nativeHome : wslHome)) throw injected;
+        return false;
+      },
+      discoverWslHome(provider, options) {
+        assert.equal(provider, ".commandcode");
+        // The shared WSL helper catches failed existence probes. The provider
+        // must still surface their observation error before reconciling zero.
+        try { options.existsSync(wslHome); } catch (_error) {}
+        return null;
+      },
+    };
+    assert.throws(() => resolveCommandCodeHomes({
+      TOKENTRACKER_WSL_MODE: probe === "native" ? "native-only" : "wsl-only",
+    }, deps), (error) => error === injected);
+  });
+}
+
+test("Command Code preserves both roots when one discovery fails and recovers pending healthy-root usage", async () => {
+  const { dir, home, filePath, repoDir, options } = makeLifecycleTree();
+  const secondHome = path.join(dir, "synthetic-wsl", ".commandcode");
+  const secondProject = path.join(secondHome, "projects", "second");
+  const secondFile = path.join(secondProject, "second.jsonl");
+  fs.mkdirSync(secondProject, { recursive: true });
+  fs.writeFileSync(secondFile, `${headerLine("second-session", repoDir)}\n${messageLine({ id: "m1", costUsd: 0.42 })}\n`);
+  const env = { TOKENTRACKER_WSL_MODE: "both" };
+  const deps = {
+    platform: "win32", nativeHome: home,
+    existsSync: (candidate) => candidate === home,
+    discoverWslHome: () => secondHome,
+  };
+  const originalReadDir = fsp.readdir;
+  const sync = async () => {
+    options.sessionFiles = await resolveCommandCodeSessionFiles(env, deps);
+    return parseCommandCodeIncremental(options);
+  };
+  try {
+    await sync();
+    const bothTotals = {
+      ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+    };
+    assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...bothTotals }]);
+    const before = JSON.parse(JSON.stringify(options.cursors));
+    const hourlyBytes = fs.readFileSync(options.queuePath);
+    const projectBytes = fs.readFileSync(options.projectQueuePath);
+    fs.appendFileSync(filePath, messageLine({ id: "m2", costUsd: 0.42 }) + "\n");
+    const injected = Object.assign(new Error("synthetic second-root failure"), { code: "EIO" });
+    fsp.readdir = async function (file, ...args) {
+      if (file === secondProject) throw injected;
+      return originalReadDir.call(this, file, ...args);
+    };
+    await assert.rejects(sync(), (error) => error === injected);
+    assert.deepEqual(options.cursors, before);
+    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+    assert.deepEqual(fs.readFileSync(options.projectQueuePath), projectBytes);
+    fsp.readdir = originalReadDir;
+    await sync();
+    const recoveredTotals = {
+      ...LIFECYCLE_TOTALS, input_tokens: 3000, output_tokens: 300,
+      total_tokens: 3300, billable_total_tokens: 3300, total_cost_usd: 1.26, conversation_count: 3,
+    };
+    assert.deepEqual(commandCodeRows(options.queuePath), [
+      { ...LIFECYCLE_ROW, ...bothTotals }, { ...LIFECYCLE_ROW, ...recoveredTotals },
+    ]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [
+      lifecycleProjectRow("acme/lifecycle-fixture", bothTotals),
+      lifecycleProjectRow("acme/lifecycle-fixture", recoveredTotals),
+    ]);
+    roundTripLifecycleCursors(options);
+    const repeat = await sync();
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+  } finally {
+    fsp.readdir = originalReadDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code keeps long leading whitespace out of its bounded header-only read", async () => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree({
+    remote: false, prefix: " ".repeat(70000), message: "synthetic body".repeat(10000),
+  });
+  const originalOpen = fsp.open;
+  try {
+    await parseCommandCodeIncremental(options);
+    writeLifecycleRemote(repoDir, "acme/lifecycle-fixture");
+    fsp.open = async function (file, ...args) {
+      const handle = await originalOpen.call(this, file, ...args);
+      if (file === filePath) handle.readFile = async () => assert.fail("leading whitespace must not force a body reread");
+      return handle;
+    };
+    const refreshed = await parseCommandCodeIncremental(options);
+    assert.equal(refreshed.recordsProcessed, 0);
+    assert.equal(refreshed.projectBucketsQueued, 1);
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+  } finally {
+    fsp.open = originalOpen;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code uses one descriptor for cold reads and short Unicode header reads", async () => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  const originalOpen = fsp.open;
+  const originalStat = fsp.stat;
+  let opens = 0;
+  let fullReads = 0;
+  let stats = 0;
+  let closes = 0;
+  let reads = 0;
+  try {
+    fsp.stat = async function (file, ...args) {
+      assert.notEqual(file, filePath, "no path-based transcript stat is allowed");
+      return originalStat.call(this, file, ...args);
+    };
+    fsp.open = async function (file, ...args) {
+      const handle = await originalOpen.call(this, file, ...args);
+      if (file !== filePath) return handle;
+      opens += 1;
+      const stat = handle.stat.bind(handle);
+      const readFile = handle.readFile.bind(handle);
+      const read = handle.read.bind(handle);
+      const close = handle.close.bind(handle);
+      handle.stat = async (...values) => { stats += 1; return stat(...values); };
+      handle.readFile = async (...values) => { fullReads += 1; return readFile(...values); };
+      handle.read = async (buffer, offset, length, position) => {
+        reads += 1;
+        return read(buffer, offset, Math.min(7, length), position);
+      };
+      handle.close = async (...values) => { closes += 1; return close(...values); };
+      return handle;
+    };
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual({ opens, fullReads, stats, closes, reads }, { opens: 1, fullReads: 1, stats: 2, closes: 1, reads: 0 });
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+    assert.deepEqual({ opens, fullReads, stats, closes }, { opens: 2, fullReads: 1, stats: 4, closes: 2 });
+    assert.ok(reads > 1, "short reads must loop until the Unicode header is complete");
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+  } finally {
+    fsp.open = originalOpen;
+    fsp.stat = originalStat;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Command Code rebuilds a transcript that changes during its cached header read on the same descriptor", async () => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  const originalOpen = fsp.open;
+  try {
+    await parseCommandCodeIncremental(options);
+    let opens = 0;
+    let appended = false;
+    let fullReads = 0;
+    fsp.open = async function (file, ...args) {
+      const handle = await originalOpen.call(this, file, ...args);
+      if (file !== filePath) return handle;
+      opens += 1;
+      const read = handle.read.bind(handle);
+      const readFile = handle.readFile.bind(handle);
+      handle.read = async (...values) => {
+        const result = await read(...values);
+        if (!appended) {
+          appended = true;
+          fs.appendFileSync(filePath, messageLine({ id: "m2", costUsd: 0.42 }) + "\n");
+        }
+        return result;
+      };
+      handle.readFile = async (...values) => { fullReads += 1; return readFile(...values); };
+      return handle;
+    };
+    const changed = await parseCommandCodeIncremental(options);
+    assert.equal(opens, 1);
+    assert.equal(fullReads, 1);
+    assert.equal(changed.recordsProcessed, 2);
+    const recoveredTotals = {
+      ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+    };
+    assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...recoveredTotals }]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", recoveredTotals)]);
+    fsp.open = originalOpen;
+    roundTripLifecycleCursors(options);
+    const repeat = await parseCommandCodeIncremental(options);
+    assert.equal(repeat.recordsProcessed, 0);
+    assert.equal(repeat.eventsAggregated, 0);
+  } finally {
+    fsp.open = originalOpen;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
