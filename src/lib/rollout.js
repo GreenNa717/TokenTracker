@@ -23076,13 +23076,11 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 //    "usage":{"inputTokens":…,"outputTokens":…,"cacheReadTokens":…,
 //             "cacheWriteTokens":…,"costUsd":…},"message":{…}}
 //
-// Two vendor conventions are load-bearing, both verified against every usage
-// record of a live install (their sum and each individual costUsd reproduce at
-// the published DeepSeek rates to the last float digit):
+// Two accounting conventions are load-bearing:
 //
-//  1. `inputTokens` is OpenAI-style prompt_tokens — it ALREADY INCLUDES cache
-//     reads. `uncached = inputTokens - cacheReadTokens`; storing the column
-//     verbatim double counts cached tokens in `total_tokens`.
+//  1. AI SDK-normalized `inputTokens` ALREADY INCLUDES cache reads and writes.
+//     `uncached = inputTokens - cacheReadTokens - cacheWriteTokens`; keeping
+//     either cache category in input double counts it in `total_tokens`.
 //  2. `costUsd` is the exact amount Command Code billed for the request, so
 //     this source is cost-authoritative (SOURCES_WITH_AUTHORITATIVE_COST in
 //     pricing/index.js). That also keeps DeepSeek's peak-hour table rates from
@@ -23092,8 +23090,10 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 // file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
 // per-file snapshot and reconciles it against a subtract-on-change ledger keyed
 // by `sessionId|recordId` — the shape the Qoder-new reader uses. Files whose
-// (size, mtime) pair is unchanged since the previous pass are not re-read.
+// (size, mtime) pair is unchanged under the current accounting version are not
+// re-read.
 const COMMAND_CODE_SOURCE = "command-code";
+const COMMAND_CODE_STATE_VERSION = 1;
 const COMMAND_CODE_HOME_DIR = ".commandcode";
 const COMMAND_CODE_PROJECTS_DIR = "projects";
 
@@ -23179,8 +23179,8 @@ function normalizeCommandCodeModelName(value) {
 }
 
 // Map Command Code's usage object onto disjoint queue columns. `inputTokens`
-// already includes the cache reads (see the section comment), so subtract them
-// back out first; returns null for an all-zero record. `costUsd` is the
+// already includes cache reads and writes (see the section comment), so subtract
+// both back out first; returns null for an all-zero record. `costUsd` is the
 // provider-reported bill; zero keeps the repository-wide "unreported" sentinel
 // and falls through to model pricing on the read side.
 function commandCodeUsageToTotals(usage) {
@@ -23189,7 +23189,7 @@ function commandCodeUsageToTotals(usage) {
   const cachedInput = toNonNegativeInt(usage.cacheReadTokens);
   const cacheWrite = toNonNegativeInt(usage.cacheWriteTokens);
   const output = toNonNegativeInt(usage.outputTokens);
-  const input = Math.max(0, inclusiveInput - cachedInput);
+  const input = Math.max(0, inclusiveInput - cachedInput - cacheWrite);
   if (input === 0 && cachedInput === 0 && cacheWrite === 0 && output === 0) return null;
   const total = input + cachedInput + cacheWrite + output;
   const reportedCost = Number(usage.costUsd);
@@ -23280,7 +23280,12 @@ function normalizeCommandCodeState(raw) {
     }
   }
   const files = {};
-  if (raw && typeof raw === "object" && raw.files && typeof raw.files === "object") {
+  // Re-read older accounting versions even when file metadata is unchanged,
+  // retaining their message totals above so reconciliation subtracts them first.
+  if (
+    raw && typeof raw === "object" && raw.version === COMMAND_CODE_STATE_VERSION &&
+    raw.files && typeof raw.files === "object"
+  ) {
     for (const [key, value] of Object.entries(raw.files)) {
       if (!value || typeof value !== "object") continue;
       const size = Number(value.size);
@@ -23290,6 +23295,7 @@ function normalizeCommandCodeState(raw) {
     }
   }
   return {
+    version: COMMAND_CODE_STATE_VERSION,
     messages,
     files,
     updatedAt: typeof raw?.updatedAt === "string" ? raw.updatedAt : null,
@@ -23341,10 +23347,15 @@ async function parseCommandCodeIncremental({
 } = {}) {
   await ensureDir(path.dirname(queuePath));
   const files = Array.isArray(sessionFiles) ? sessionFiles : [];
-  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  // Normalizers retain nested bucket objects. Isolate this provider's working
+  // state so an append failure cannot publish totals or queuedKey changes
+  // through the original cursors before both queues have succeeded.
+  const hourlyState = normalizeHourlyState(structuredClone(cursors?.hourly));
   const state = normalizeCommandCodeState(cursors?.commandCode);
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
-  const projectState = projectEnabled ? normalizeProjectState(cursors?.projectHourly) : null;
+  const projectState = projectEnabled
+    ? normalizeProjectState(structuredClone(cursors?.projectHourly))
+    : null;
   const projectTouchedBuckets = projectEnabled ? new Set() : null;
   const projectMetaCache = projectEnabled ? new Map() : null;
   const publicRepoCache = projectEnabled ? new Map() : null;

@@ -11,9 +11,10 @@
  * This suite covers:
  *   - `resolveCommandCodeHome(s)` precedence and the Windows native/WSL matrix
  *   - `resolveCommandCodeSessionFiles` transcript discovery (checkpoints skipped)
- *   - usage normalization (OpenAI-style cache-inclusive input; billed costUsd)
+ *   - usage normalization (AI SDK cache-inclusive input; billed costUsd)
  *   - rebuild-and-diff reconciliation: rerun no-op, rewritten transcript,
- *     deleted session, and queue-append failures
+ *     deleted session, pre-fix cursor migration, and queue-append failures
+ *   - per-model accounting across cache reads, writes, and uncached usage
  *   - the committed fixture's sanitization contract
  *
  * The sample fixture is a real, sanitized transcript (token counts and the
@@ -26,6 +27,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const { computeRowCost } = require("../src/lib/pricing");
 
 const {
   resolveCommandCodeHome,
@@ -76,6 +78,106 @@ function makeTree({ slug = "c-users-mechrevo", sessionId = "sess-1", lines = [] 
   const filePath = path.join(projectDir, `${sessionId}.jsonl`);
   fs.writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
   return { dir, home, projectDir, filePath };
+}
+
+function makeLegacyCommandCodeTree() {
+  const sessionId = "sess-migrate";
+  const { dir, filePath } = makeTree({ sessionId });
+  const repoDir = path.join(dir, "repo");
+  const queuePath = path.join(dir, "queue.jsonl");
+  const projectQueuePath = path.join(dir, "queue.project.jsonl");
+  const projectKey = "acme/commandcode-fixture";
+  const projectRef = `https://github.com/${projectKey}`;
+  const model = "claude-sonnet-4-5";
+
+  fs.mkdirSync(path.join(repoDir, ".git"), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, ".git", "config"), `[remote "origin"]\n\turl = ${projectRef}.git\n`, "utf8");
+  fs.writeFileSync(filePath, [
+    headerLine(sessionId, repoDir),
+    messageLine({
+      id: "m1",
+      model: `anthropic/${model}`,
+      inputTokens: 750,
+      cacheReadTokens: 600,
+      cacheWriteTokens: 50,
+      outputTokens: 20,
+      costUsd: 0.001,
+    }),
+  ].join("\n") + "\n", "utf8");
+  const { size, mtimeMs } = fs.statSync(filePath);
+  const oldTotals = {
+    input_tokens: 150,
+    cached_input_tokens: 600,
+    cache_creation_input_tokens: 50,
+    output_tokens: 20,
+    reasoning_output_tokens: 0,
+    total_tokens: 820,
+    billable_total_tokens: 820,
+    total_cost_usd: 0.001,
+    conversation_count: 1,
+  };
+  const oldQueuedKey = "150|600|50|20|0|820|820|0.001|1";
+  const hourlyKey = `command-code|${model}|${T0}`;
+  const projectBucketKey = `${projectKey}|command-code|${T0}`;
+  const messageKey = `command-code:${sessionId}|m1`;
+  const oldRow = { source: "command-code", model, hour_start: T0, ...oldTotals };
+  const oldProjectRow = {
+    project_key: projectKey,
+    project_ref: projectRef,
+    source: "command-code",
+    hour_start: T0,
+    ...oldTotals,
+  };
+  fs.writeFileSync(queuePath, JSON.stringify(oldRow) + "\n", "utf8");
+  fs.writeFileSync(projectQueuePath, JSON.stringify(oldProjectRow) + "\n", "utf8");
+  // Seed the exact pre-fix persisted shape, not values from the parser under
+  // test: retaining this ledger is necessary to subtract the inflated bill.
+  const cursors = {
+    hourly: {
+      version: 3,
+      buckets: { [hourlyKey]: { totals: { ...oldTotals }, queuedKey: oldQueuedKey } },
+      groupQueued: {},
+    },
+    projectHourly: {
+      version: 2,
+      buckets: {
+        [projectBucketKey]: {
+          project_key: projectKey,
+          project_ref: projectRef,
+          source: "command-code",
+          hour_start: T0,
+          totals: { ...oldTotals },
+          queuedKey: oldQueuedKey,
+        },
+      },
+      projects: {},
+    },
+    commandCode: {
+      messages: {
+        [messageKey]: {
+          totals: { ...oldTotals },
+          conversationCount: 1,
+          bucketStart: T0,
+          model,
+          projectKey,
+          projectRef,
+          filePath,
+          updatedAt: T0,
+        },
+      },
+      files: { [filePath]: { size, mtimeMs } },
+      updatedAt: T0,
+    },
+  };
+  const publicRepoResolver = async ({ projectRef: resolvedRef }) => {
+    assert.equal(resolvedRef, projectRef);
+    return { status: "public_verified", projectKey, projectRef };
+  };
+  return {
+    dir, filePath, size, mtimeMs, oldTotals, oldRow, oldProjectRow,
+    hourlyKey, projectBucketKey, messageKey,
+    options: { sessionFiles: [filePath], cursors, queuePath, projectQueuePath, publicRepoResolver },
+  };
 }
 
 function readRows(queuePath) {
@@ -243,6 +345,24 @@ test("commandCodeUsageToTotals subtracts cache reads from the cache-inclusive in
   assert.equal(clamped.total_cost_usd, 0, "an unreported cost keeps the zero sentinel");
 });
 
+// Command Code's AI SDK-normalized inputTokens includes cache writes as well
+// as cache reads. Both cache columns must be disjoint from uncached input.
+for (const fixture of [
+  { inputTokens: 750, cacheReadTokens: 600, cacheWriteTokens: 50, outputTokens: 20, input: 100, total: 770 },
+  { inputTokens: 150, cacheReadTokens: 0, cacheWriteTokens: 50, outputTokens: 20, input: 100, total: 170 },
+]) {
+  test(`commandCodeUsageToTotals subtracts cache writes with ${fixture.cacheReadTokens} cache-read tokens`, () => {
+    const row = commandCodeUsageToTotals(fixture);
+    assert.equal(row.input_tokens, fixture.input);
+    assert.equal(row.cached_input_tokens, fixture.cacheReadTokens);
+    assert.equal(row.cache_creation_input_tokens, fixture.cacheWriteTokens);
+    assert.equal(row.output_tokens, fixture.outputTokens);
+    assert.equal(row.reasoning_output_tokens, 0);
+    assert.equal(row.total_tokens, fixture.total);
+    assert.equal(row.billable_total_tokens, fixture.total);
+  });
+}
+
 test("normalizeCommandCodeModelName strips the provider prefix", () => {
   assert.equal(normalizeCommandCodeModelName("deepseek/deepseek-v4.1-flash"), "deepseek-v4.1-flash");
   assert.equal(normalizeCommandCodeModelName("gpt-6-sol"), "gpt-6-sol");
@@ -337,6 +457,165 @@ test("parseCommandCodeIncremental queues the committed fixture, skips unchanged 
   assert.equal(commandCodeRows(queuePath).length, 1, "no duplicate bucket rows");
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("parseCommandCodeIncremental corrects an unversioned ledger even when file metadata is unchanged", async () => {
+  const {
+    dir, filePath, size, mtimeMs, oldTotals, oldRow, oldProjectRow,
+    hourlyKey, projectBucketKey, messageKey, options,
+  } = makeLegacyCommandCodeTree();
+  const { cursors, queuePath, projectQueuePath } = options;
+
+  try {
+    const first = await parseCommandCodeIncremental(options);
+    assert.equal(first.recordsProcessed, 1, "an unversioned file fingerprint must be invalidated");
+    assert.equal(first.eventsAggregated, 1);
+    assert.equal(first.bucketsQueued, 1);
+    assert.equal(first.projectBucketsQueued, 1);
+    const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770 };
+    assert.deepEqual(commandCodeRows(queuePath), [oldRow, { ...oldRow, ...corrected }]);
+    assert.deepEqual(commandCodeRows(projectQueuePath), [oldProjectRow, { ...oldProjectRow, ...corrected }]);
+    assert.equal(cursors.commandCode.version, 1);
+    assert.deepEqual(cursors.commandCode.messages[messageKey].totals, corrected);
+    assert.deepEqual(cursors.hourly.buckets[hourlyKey].totals, corrected);
+    assert.deepEqual(cursors.projectHourly.buckets[projectBucketKey].totals, corrected);
+    assert.deepEqual(cursors.commandCode.files[filePath], { size, mtimeMs });
+    const currentStat = fs.statSync(filePath);
+    assert.equal(currentStat.size, size);
+    assert.equal(currentStat.mtimeMs, mtimeMs, "migration must not depend on a transcript rewrite");
+
+    const second = await parseCommandCodeIncremental({
+      ...options,
+      cursors: JSON.parse(JSON.stringify(cursors)),
+    });
+    assert.equal(second.recordsProcessed, 0, "the versioned fingerprint is reusable after migration");
+    assert.equal(second.eventsAggregated, 0);
+    assert.equal(second.bucketsQueued, 0);
+    assert.equal(second.projectBucketsQueued, 0);
+    assert.deepEqual(commandCodeRows(queuePath), [oldRow, { ...oldRow, ...corrected }]);
+    assert.deepEqual(commandCodeRows(projectQueuePath), [oldProjectRow, { ...oldProjectRow, ...corrected }]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const failedQueue of ["hourly", "project"]) {
+  test(`parseCommandCodeIncremental preserves old cursors and retries corrections after ${failedQueue} append failure`, async () => {
+    const { dir, oldTotals, oldRow, oldProjectRow, options } = makeLegacyCommandCodeTree();
+    const { cursors, queuePath, projectQueuePath } = options;
+    const failedPath = failedQueue === "hourly" ? queuePath : projectQueuePath;
+    const savedPath = `${failedPath}.saved`;
+    const before = JSON.parse(JSON.stringify(cursors));
+
+    try {
+      fs.renameSync(failedPath, savedPath);
+      fs.mkdirSync(failedPath);
+      await assert.rejects(parseCommandCodeIncremental(options), /EISDIR|directory/i);
+      assert.deepEqual(cursors.hourly, before.hourly, "failed append must not publish totals or queuedKey");
+      assert.deepEqual(cursors.projectHourly, before.projectHourly, "project state must stay isolated too");
+      assert.deepEqual(cursors.commandCode, before.commandCode, "old messages and file fingerprints remain retryable");
+
+      fs.rmdirSync(failedPath);
+      fs.renameSync(savedPath, failedPath);
+      const retry = await parseCommandCodeIncremental(options);
+      assert.equal(retry.recordsProcessed, 1);
+      assert.equal(retry.eventsAggregated, 1);
+      assert.equal(retry.bucketsQueued, 1, "the hourly correction must really be appended on retry");
+      assert.equal(retry.projectBucketsQueued, 1, "the project correction must really be appended on retry");
+      const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770 };
+      const hourlyRows = commandCodeRows(queuePath);
+      const projectRows = commandCodeRows(projectQueuePath);
+      // A project-append failure can leave an hourly snapshot on disk. Retrying
+      // that same snapshot is safe: queue consumers use the latest row per key.
+      assert.equal(hourlyRows.length, failedQueue === "hourly" ? 2 : 3);
+      assert.equal(projectRows.length, 2);
+      assert.deepEqual(hourlyRows.at(-1), { ...oldRow, ...corrected });
+      assert.deepEqual(projectRows.at(-1), { ...oldProjectRow, ...corrected });
+      assert.equal(cursors.commandCode.version, 1);
+
+      const repeat = await parseCommandCodeIncremental({
+        ...options, cursors: JSON.parse(JSON.stringify(cursors)),
+      });
+      assert.equal(repeat.recordsProcessed, 0);
+      assert.equal(repeat.eventsAggregated, 0);
+      assert.equal(repeat.bucketsQueued, 0);
+      assert.equal(repeat.projectBucketsQueued, 0);
+      assert.deepEqual(commandCodeRows(queuePath), hourlyRows);
+      assert.deepEqual(commandCodeRows(projectQueuePath), projectRows);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("parseCommandCodeIncremental keeps mixed-model cache accounting disjoint and reported costs authoritative", async () => {
+  const fixtures = [
+    {
+      id: "cache-read-only", model: "deepseek/deepseek-v4.1-flash",
+      inputTokens: 700, cacheReadTokens: 600, cacheWriteTokens: 0, outputTokens: 20,
+      input: 100, total: 720, costUsd: 0.001,
+    },
+    {
+      id: "cache-write-only", model: "anthropic/claude-sonnet-4-5",
+      inputTokens: 150, cacheReadTokens: 0, cacheWriteTokens: 50, outputTokens: 20,
+      input: 100, total: 170, costUsd: 0.002,
+    },
+    {
+      id: "combined-caches", model: "anthropic/claude-opus-4-6",
+      inputTokens: 750, cacheReadTokens: 600, cacheWriteTokens: 50, outputTokens: 20,
+      input: 100, total: 770, costUsd: 0.003,
+    },
+    {
+      id: "uncached", model: "openai/gpt-5.4",
+      inputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 20,
+      input: 100, total: 120, costUsd: 0.004,
+    },
+  ];
+  const { dir, filePath } = makeTree({
+    sessionId: "sess-mixed",
+    lines: [headerLine("sess-mixed"), ...fixtures.map((fixture) => messageLine(fixture))],
+  });
+  const queuePath = path.join(dir, "queue.jsonl");
+  const cursors = {};
+
+  try {
+    const first = await parseCommandCodeIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(first.recordsProcessed, fixtures.length);
+    assert.equal(first.eventsAggregated, fixtures.length);
+    assert.equal(first.bucketsQueued, fixtures.length, "models sharing one half-hour keep separate buckets");
+    const rows = latestCommandCodeRows(queuePath);
+    assert.equal(rows.size, fixtures.length);
+    for (const fixture of fixtures) {
+      const model = fixture.model.split("/")[1];
+      const row = rows.get(`${model}|${T0}`);
+      assert.deepEqual(row, {
+        source: "command-code",
+        model,
+        hour_start: T0,
+        input_tokens: fixture.input,
+        cached_input_tokens: fixture.cacheReadTokens,
+        cache_creation_input_tokens: fixture.cacheWriteTokens,
+        output_tokens: fixture.outputTokens,
+        reasoning_output_tokens: 0,
+        total_tokens: fixture.total,
+        billable_total_tokens: fixture.total,
+        total_cost_usd: fixture.costUsd,
+        conversation_count: 1,
+      }, fixture.id);
+      assert.equal(computeRowCost(row), fixture.costUsd, `${fixture.id} keeps the provider-reported bill`);
+    }
+
+    const second = await parseCommandCodeIncremental({
+      sessionFiles: [filePath], cursors: JSON.parse(JSON.stringify(cursors)), queuePath,
+    });
+    assert.equal(second.recordsProcessed, 0);
+    assert.equal(second.eventsAggregated, 0);
+    assert.equal(second.bucketsQueued, 0);
+    assert.equal(commandCodeRows(queuePath).length, fixtures.length);
+    assert.deepEqual(latestCommandCodeRows(queuePath), rows);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("parseCommandCodeIncremental reconciles a rewritten transcript (resume/compaction) without double counting", async () => {
