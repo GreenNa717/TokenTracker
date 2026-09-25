@@ -57,7 +57,7 @@ function fixture(t) {
 
 // Each test gets private CommonJS module instances and private built-in
 // dependency facades. No global fs method, require cache or WSL cache is patched.
-function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, runWsl } = {}) {
+function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, runWsl, onHandle, onOpen } = {}) {
   const cache = new Map();
   const localEnv = {
     PATH: process.env.PATH || "", SystemRoot: process.env.SystemRoot || "C:\\Windows",
@@ -76,7 +76,25 @@ function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, r
       const resolved = redirect(file);
       const error = ioFailure?.(method, resolved);
       if (error) throw error;
-      return fsp[method](resolved, ...args);
+      if (method === "open") onOpen?.(resolved, args);
+      const value = await fsp[method](resolved, ...args);
+      if (method !== "open") return value;
+      onHandle?.(value, resolved);
+      for (const operation of ["stat", "readFile", "close"]) {
+        const invoke = value[operation].bind(value);
+        value[operation] = async (...handleArgs) => {
+          const failure = ioFailure?.(operation, resolved, value);
+          // Simulated close failures still release this real fixture handle.
+          if (operation === "close") {
+            const result = await invoke(...handleArgs);
+            if (failure) throw failure;
+            return result;
+          }
+          if (failure) throw failure;
+          return invoke(...handleArgs);
+        };
+      }
+      return value;
     };
   }
   const localFs = { ...fs, promises: localPromises };
@@ -679,3 +697,140 @@ for (const scenario of ["nonempty", "failed"]) {
     assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
   });
 }
+
+for (const kind of ["gitfile", "commondir", "config"]) {
+  test(`CodeQL Git metadata ${kind} content and metadata keep the identity checked before pathname replacement`, async (t) => {
+    const { home } = fixture(t);
+    const worktree = path.join(home, "codeql-worktree");
+    const admin = path.join(home, "admin-original");
+    const otherAdmin = path.join(home, "admin-replacement");
+    const common = path.join(home, "common-original.git");
+    const otherCommon = path.join(home, "common-replacement.git");
+    const gitfile = path.join(worktree, ".git");
+    const commondir = path.join(admin, "commondir");
+    const config = path.join(common, "config");
+    const otherRef = "https://github.com/acme/replacement-codeql";
+    write(gitfile, "gitdir: ../admin-original\n");
+    write(commondir, "../common-original.git\n");
+    write(config, `[remote "origin"]\n\turl = ${PROJECT_ROW.project_ref}.git\n`);
+    write(path.join(otherAdmin, "commondir"), "../common-replacement.git\n");
+    write(path.join(otherCommon, "config"), `[remote "origin"]\n\turl = ${otherRef}.git\n`);
+    const target = { gitfile, commondir, config }[kind];
+    const replacement = `${target}.replacement`;
+    const saved = `${target}.original`;
+    const replacementText = {
+      gitfile: "gitdir: ../admin-replacement\n",
+      commondir: "../common-replacement.git\n",
+      config: `[remote "origin"]\n\turl = ${otherRef}.git\n`,
+    }[kind];
+    write(replacement, replacementText);
+    fs.utimesSync(replacement, new Date("2001-01-01T00:00:00Z"), new Date("2001-01-01T00:00:00Z"));
+    const checkedConfig = fs.statSync(config);
+    const opened = [];
+    let replaced = false;
+    let pathnameReads = 0;
+    const runtime = scopedModules({ home,
+      onHandle(handle, file) { opened.push({ handle, file }); },
+      ioFailure(method, file, handle) {
+        if (method === "readFile" && file === target) {
+          if (!handle) pathnameReads += 1;
+          if (!replaced) {
+            for (const candidate of [target, replacement, saved]) {
+              assert.ok(path.resolve(candidate).startsWith(home + path.sep), "replacement stays in the synthetic fixture");
+            }
+            fs.renameSync(target, saved);
+            fs.renameSync(replacement, target);
+            replaced = true;
+          }
+        }
+        return null;
+      },
+    });
+    const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
+    const context = await helpers.resolveProjectContextForPath({ startDir: worktree, strictIo: true });
+    assert.equal(replaced, true, "the filesystem swap must really occur before the content read");
+    assert.equal(fs.readFileSync(target, "utf8"), replacementText);
+    assert.deepEqual(context, {
+      projectRef: PROJECT_ROW.project_ref, projectKey: PROJECT_KEY, status: "public_verified",
+      configPath: config, configMtimeMs: checkedConfig.mtimeMs, configSize: checkedConfig.size,
+    }, "the snapshot must not read replacement bytes or combine one file's stat with another's remote");
+    assert.equal(pathnameReads, 0);
+    assert.equal(opened.filter((entry) => entry.file === target).length, 1);
+    for (const { handle } of opened) assert.equal(handle.fd, -1, "every opened metadata descriptor is closed");
+  });
+}
+
+for (const strictIo of [false, true]) {
+  for (const scenario of ["success", "missing", "directory", "non-file", "stat-error", "read-error", "close-error"]) {
+    test(`CodeQL Git metadata ${scenario} closes handles with strictIo=${strictIo}`, async (t) => {
+      const { home, config } = fixture(t);
+      const target = scenario === "missing" ? path.join(home, "missing-config")
+        : scenario === "directory" ? path.dirname(config) : config;
+      const failure = Object.assign(new Error(`synthetic ${scenario}`), { code: scenario === "stat-error" ? "EACCES" : "EIO" });
+      const opened = [];
+      let openAttempts = 0;
+      let readAttempts = 0;
+      let pathnameReads = 0;
+      const runtime = scopedModules({ home,
+        onHandle(handle, file) {
+          if (file !== target) return;
+          opened.push(handle);
+          if (scenario === "non-file") {
+            const stat = handle.stat.bind(handle);
+            handle.stat = async () => ({ ...await stat(), isFile: () => false, isDirectory: () => false });
+          }
+        },
+        ioFailure(method, file, handle) {
+          if (file !== target) return null;
+          if (method === "open") openAttempts += 1;
+          if (method === "readFile") { readAttempts += 1; if (!handle) pathnameReads += 1; }
+          if ((scenario === "stat-error" && method === "stat") ||
+              (scenario === "read-error" && method === "readFile") ||
+              (scenario === "close-error" && method === "close")) return failure;
+          return null;
+        },
+      });
+      const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
+      if (strictIo && scenario.endsWith("-error")) {
+        await assert.rejects(helpers.readGitRemoteUrl(target, { strictIo }), (error) => error === failure);
+      } else {
+        assert.equal(await helpers.readGitRemoteUrl(target, { strictIo }),
+          scenario === "success" ? `${PROJECT_ROW.project_ref}.git` : null);
+      }
+      assert.equal(openAttempts, 1);
+      assert.equal(pathnameReads, 0, "metadata text must use descriptor reads only");
+      if (["missing", "directory", "non-file", "stat-error"].includes(scenario)) assert.equal(readAttempts, 0);
+      if (!["missing", "directory"].includes(scenario)) assert.equal(opened.length, 1);
+      for (const handle of opened) assert.equal(handle.fd, -1);
+    });
+  }
+}
+
+test("CodeQL Git metadata closes after read and close failures while preserving the original strict error", async (t) => {
+  const { home, config } = fixture(t);
+  const readFailure = Object.assign(new Error("synthetic read EIO"), { code: "EIO" });
+  const closeFailure = Object.assign(new Error("synthetic close EPERM"), { code: "EPERM" });
+  const opened = [];
+  const runtime = scopedModules({ home,
+    onHandle(handle) { opened.push(handle); },
+    ioFailure(method, file) {
+      if (file !== config) return null;
+      return method === "readFile" ? readFailure : method === "close" ? closeFailure : null;
+    },
+  });
+  const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
+  await assert.rejects(helpers.readGitRemoteUrl(config, { strictIo: true }), (error) => error === readFailure);
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].fd, -1);
+});
+
+test("CodeQL Git metadata uses nonblocking open where supported before inspecting a possibly special file", async (t) => {
+  const { home, config } = fixture(t);
+  const flags = [];
+  const runtime = scopedModules({ home, onOpen(file, args) {
+    if (file === config) flags.push(args[0]);
+  } });
+  const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
+  assert.equal(await helpers.readGitRemoteUrl(config, { strictIo: true }), `${PROJECT_ROW.project_ref}.git`);
+  assert.deepEqual(flags, [fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0)]);
+});

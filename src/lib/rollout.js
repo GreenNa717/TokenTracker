@@ -4182,6 +4182,40 @@ function projectMetadataFallback(error, strictIo, fallback) {
   return fallback;
 }
 
+// Pin metadata text and its type/fingerprint to one opened file identity. A
+// pathname replacement after fstat must not substitute another file's bytes.
+async function readGitMetadataSnapshot(filePath, { strictIo = false, allowDirectory = false } = {}) {
+  let handle = null;
+  let snapshot = null;
+  let failure = null;
+  try {
+    // On POSIX, inspecting a FIFO/non-file must not wait for a writer first.
+    const flags = fssync.constants.O_RDONLY | (fssync.constants.O_NONBLOCK || 0);
+    handle = await fs.open(filePath, flags);
+    const stat = await handle.stat();
+    if (stat.isFile()) {
+      snapshot = { stat, text: await handle.readFile("utf8") };
+    } else if (allowDirectory && stat.isDirectory()) {
+      snapshot = { directory: true };
+    }
+  } catch (error) {
+    // An open that reports EISDIR can still select a config child; this
+    // result is never used to read the directory path itself as text.
+    if (!handle && allowDirectory && error?.code === "EISDIR") snapshot = { directory: true };
+    else failure = error;
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (error) {
+        // A cleanup failure must not hide the original stat/read failure.
+        if (!failure) failure = error;
+      }
+    }
+  }
+  return failure ? projectMetadataFallback(failure, strictIo, null) : snapshot;
+}
+
 async function resolveProjectMetaForPath(startDir, cache, { strictIo = false } = {}) {
   if (!startDir || typeof startDir !== "string") return null;
   if (cache && cache.has(startDir)) return cache.get(startDir);
@@ -4205,8 +4239,9 @@ async function resolveProjectMetaForPath(startDir, cache, { strictIo = false } =
 
     const configPath = await resolveGitConfigPath(current, { strictIo });
     if (configPath) {
-      const configStat = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
-      const remoteUrl = await readGitRemoteUrl(configPath, { strictIo });
+      const snapshot = await readGitMetadataSnapshot(configPath, { strictIo });
+      const configStat = snapshot?.stat || null;
+      const remoteUrl = parseGitRemoteUrl(snapshot?.text || "");
       const projectRef = canonicalizeProjectRef(remoteUrl);
       const meta = {
         projectRef: projectRef || null,
@@ -4526,16 +4561,15 @@ async function resolveClaudeFileCwd(filePath) {
 
 async function resolveGitConfigPath(rootDir, { strictIo = false } = {}) {
   const gitPath = path.join(rootDir, ".git");
-  const st = await fs.stat(gitPath).catch((error) => projectMetadataFallback(error, strictIo, null));
-  if (!st) return null;
-  if (st.isDirectory()) {
+  const git = await readGitMetadataSnapshot(gitPath, { strictIo, allowDirectory: true });
+  if (!git) return null;
+  if (git.directory) {
     const configPath = path.join(gitPath, "config");
     const cfg = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
     return cfg && cfg.isFile() ? configPath : null;
   }
-  if (st.isFile()) {
-    const content = await fs.readFile(gitPath, "utf8").catch((error) => projectMetadataFallback(error, strictIo, ""));
-    const match = content.match(/gitdir:\s*(.+)/i);
+  if (git.stat?.isFile()) {
+    const match = git.text.match(/gitdir:\s*(.+)/i);
     if (!match) return null;
     let gitDir = match[1].trim();
     if (!gitDir) return null;
@@ -4546,8 +4580,7 @@ async function resolveGitConfigPath(rootDir, { strictIo = false } = {}) {
     const cfg = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
     if (cfg && cfg.isFile()) return configPath;
 
-    const commonDirRaw = await fs.readFile(path.join(gitDir, "commondir"), "utf8")
-      .catch((error) => projectMetadataFallback(error, strictIo, ""));
+    const commonDirRaw = (await readGitMetadataSnapshot(path.join(gitDir, "commondir"), { strictIo }))?.text || "";
     const commonDirRel = commonDirRaw.trim();
     if (!commonDirRel) return null;
     let commonDir = commonDirRel;
@@ -4562,7 +4595,11 @@ async function resolveGitConfigPath(rootDir, { strictIo = false } = {}) {
 }
 
 async function readGitRemoteUrl(configPath, { strictIo = false } = {}) {
-  const raw = await fs.readFile(configPath, "utf8").catch((error) => projectMetadataFallback(error, strictIo, ""));
+  const snapshot = await readGitMetadataSnapshot(configPath, { strictIo });
+  return parseGitRemoteUrl(snapshot?.text || "");
+}
+
+function parseGitRemoteUrl(raw) {
   if (!raw.trim()) return null;
 
   const remotes = new Map();
