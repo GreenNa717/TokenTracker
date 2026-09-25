@@ -29,11 +29,15 @@ function defaultRunWsl(args, { utf16 = false } = {}) {
   return utf16 ? buf.toString("utf16le") : buf.toString("utf8");
 }
 
+function cleanWslOutput(raw) {
+  return raw.replace(/\0/g, "").replace(/\uFEFF/g, "").trim();
+}
+
 function parseWslListVerbose(raw) {
   if (typeof raw !== "string") return [];
   const distros = [];
   for (const line of raw.split(/\r?\n/)) {
-    const clean = line.replace(/\0/g, "").replace(/\uFEFF/g, "").trim();
+    const clean = cleanWslOutput(line);
     if (!clean) continue;
     const cells = clean.split(/\s+/);
     let isDefault = false;
@@ -61,13 +65,26 @@ function probeWslDistros(deps = {}) {
   try {
     raw = runWsl(["-l", "-v"], { utf16: true });
   } catch (error) {
+    let confirmedEmpty = false;
+    if (
+      strict && Number.isInteger(error?.status) && error.status !== 0 &&
+      error.signal == null && (error.code == null || error.code === error.status)
+    ) {
+      // Some WSL builds exit nonzero for an empty verbose list. Confirm that
+      // case with a successful empty quiet list, not localized diagnostic text.
+      // Transport/permission/signal failures must never reach this fallback.
+      try {
+        const quiet = runWsl(["-l", "-q"], { utf16: true });
+        confirmedEmpty = typeof quiet === "string" && cleanWslOutput(quiet) === "";
+      } catch (_quietError) { }
+    }
     if (!hasDeps) {
       _cachedDistros = [];
-      _cachedDistrosError = error;
+      _cachedDistrosError = confirmedEmpty ? null : error;
     }
     // ENOENT confirms wsl.exe is not installed. A failed invocation of an
     // existing executable is not evidence of an empty distro list.
-    if (strict && error?.code !== "ENOENT") throw error;
+    if (strict && error?.code !== "ENOENT" && !confirmedEmpty) throw error;
     return [];
   }
   const distros = parseWslListVerbose(raw);

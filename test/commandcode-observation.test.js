@@ -495,3 +495,187 @@ test("actual cmdSync preserves v2 core and both queues on Git config EIO, withou
   assert.deepEqual(fs.readFileSync(queue), hourly);
   assert.deepEqual(fs.readFileSync(project), projectBytes);
 });
+
+function finishedVerboseListError(fields = {}) {
+  return Object.assign(new Error("已完成的本地化 WSL 诊断，不应通过文本匹配判断含义"), {
+    status: 4294967295, signal: null, ...fields,
+  });
+}
+
+for (const [name, quiet] of [
+  ["empty", ""], ["BOM", "\uFEFF"], ["NUL", "\u0000"],
+  ["mixed whitespace", "\uFEFF\u0000 \t\r\n\u0000\uFEFF"],
+]) {
+  test(`R3 completed nonzero verbose + ${name} quiet confirms absence and discovers native Command Code`, async (t) => {
+    const { home, file } = fixture(t);
+    let verboseCalls = 0;
+    let quietCalls = 0;
+    const runtime = scopedModules({ home, env: { TOKENTRACKER_WSL_MODE: "" }, runWsl(args) {
+      if (args[1] === "-v") { verboseCalls += 1; throw finishedVerboseListError(); }
+      assert.deepEqual(args, ["-l", "-q"]);
+      quietCalls += 1;
+      return Buffer.from(quiet, "utf16le");
+    } });
+    const rollout = runtime.load("src/lib/rollout.js");
+    assert.deepEqual(await rollout.resolveCommandCodeSessionFiles(), [file]);
+    assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 1, quietCalls: 1 });
+    assert.deepEqual(await rollout.resolveCommandCodeSessionFiles(), [file]);
+    assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 1, quietCalls: 1 },
+      "successful absence is cached, not retried as a failed negative result");
+  });
+}
+
+test("R3 legacy callers do not issue quiet probes, while strict calls can confirm their failed cache", (t) => {
+  const { home } = fixture(t);
+  let verboseCalls = 0;
+  let quietCalls = 0;
+  const runtime = scopedModules({ home, runWsl(args) {
+    if (args[1] === "-v") { verboseCalls += 1; throw finishedVerboseListError(); }
+    assert.deepEqual(args, ["-l", "-q"]);
+    quietCalls += 1;
+    return Buffer.from("", "utf16le");
+  } });
+  const wsl = runtime.load("src/lib/wsl-probe.js");
+  assert.deepEqual(wsl.probeWslDistros(), []);
+  assert.deepEqual(wsl.probeWslDistros(), []);
+  assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 1, quietCalls: 0 });
+  assert.deepEqual(wsl.probeWslDistros({ strict: true }), []);
+  assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 2, quietCalls: 1 });
+  assert.deepEqual(wsl.probeWslDistros({ strict: true }), []);
+  assert.deepEqual(wsl.probeWslDistros(), []);
+  assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 2, quietCalls: 1 });
+});
+
+for (const scenario of ["nonempty", "failed"]) {
+  test(`R3 ${scenario} quiet preserves the original failure and retries after recovery without cache reset`, (t) => {
+    const { home } = fixture(t);
+    const original = finishedVerboseListError();
+    let recovered = false;
+    let verboseCalls = 0;
+    let quietCalls = 0;
+    const runtime = scopedModules({ home, runWsl(args) {
+      if (args[1] === "-v") {
+        verboseCalls += 1;
+        if (!recovered) throw original;
+        return Buffer.from("  NAME STATE VERSION\n* Synthetic Running 2\n", "utf16le");
+      }
+      assert.deepEqual(args, ["-l", "-q"]);
+      quietCalls += 1;
+      if (scenario === "failed") throw Object.assign(new Error("synthetic quiet EIO"), { code: "EIO" });
+      return Buffer.from("\uFEFF\u0000 Synthetic\r\n", "utf16le");
+    } });
+    const wsl = runtime.load("src/lib/wsl-probe.js");
+    assert.throws(() => wsl.probeWslDistros({ strict: true }), (error) => error === original);
+    assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 1, quietCalls: 1 });
+    assert.deepEqual(wsl.probeWslDistros(), [], "legacy fallback still reuses its failed cache");
+    recovered = true;
+    const expected = [{ name: "Synthetic", version: 2, isDefault: true }];
+    assert.deepEqual(wsl.probeWslDistros({ strict: true }), expected);
+    assert.deepEqual(wsl.probeWslDistros({ strict: true }), expected);
+    assert.deepEqual({ verboseCalls, quietCalls }, { verboseCalls: 2, quietCalls: 1 });
+  });
+}
+
+test("R3 only a string-valued empty quiet result confirms absence", (t) => {
+  const { home } = fixture(t);
+  const wsl = scopedModules({ home }).load("src/lib/wsl-probe.js");
+  for (const quiet of [undefined, null, 0, false, Buffer.alloc(0)]) {
+    const original = finishedVerboseListError();
+    let quietCalls = 0;
+    assert.throws(() => wsl.probeWslDistros({ strict: true, runWsl(args) {
+      if (args[1] === "-v") throw original;
+      assert.deepEqual(args, ["-l", "-q"]);
+      quietCalls += 1;
+      return quiet;
+    } }), (error) => error === original);
+    assert.equal(quietCalls, 1);
+  }
+});
+
+for (const [name, fields] of [
+  ["timeout", { status: 1, code: "ETIMEDOUT", signal: null }],
+  ["process I/O", { status: 1, code: "EIO", signal: null }],
+  ["EACCES", { status: 1, code: "EACCES", signal: null }],
+  ["EPERM", { status: 1, code: "EPERM", signal: null }],
+  ["signal termination", { status: 1, signal: "SIGTERM" }],
+  ["unfinished status", { status: null, signal: null }],
+  ["zero status", { status: 0, signal: null }],
+  ["string status", { status: "4294967295", signal: null }],
+  ["NaN status", { status: NaN, signal: null }],
+  ["infinite status", { status: Infinity, signal: null }],
+]) {
+  test(`R3 ${name} is not a completed nonzero exit and never falls back to empty quiet output`, (t) => {
+    const { home } = fixture(t);
+    const original = finishedVerboseListError(fields);
+    let quietCalls = 0;
+    const runtime = scopedModules({ home, runWsl(args) {
+      if (args[1] === "-v") throw original;
+      quietCalls += 1;
+      return Buffer.from("", "utf16le");
+    } });
+    const wsl = runtime.load("src/lib/wsl-probe.js");
+    assert.throws(() => wsl.probeWslDistros({ strict: true }), (error) => error === original);
+    assert.equal(quietCalls, 0);
+  });
+}
+
+test("R3 a numeric code equal to the finished exit status may confirm with quiet output", (t) => {
+  const { home } = fixture(t);
+  let quietCalls = 0;
+  const runtime = scopedModules({ home, runWsl(args) {
+    if (args[1] === "-v") throw finishedVerboseListError({ status: 1, code: 1 });
+    assert.deepEqual(args, ["-l", "-q"]);
+    quietCalls += 1;
+    return Buffer.from("", "utf16le");
+  } });
+  assert.deepEqual(runtime.load("src/lib/wsl-probe.js").probeWslDistros({ strict: true }), []);
+  assert.equal(quietCalls, 1);
+});
+
+for (const scenario of ["nonempty", "failed"]) {
+  test(`R3 default-mode cmdSync uses native usage but preserves v2 bytes on ${scenario} quiet confirmation`, async (t) => {
+    const { home, file } = fixture(t);
+    let fail = false;
+    const options = { home, env: { TOKENTRACKER_WSL_MODE: "" }, runWsl(args) {
+      if (args[1] === "-v") throw finishedVerboseListError();
+      assert.deepEqual(args, ["-l", "-q"]);
+      if (fail && scenario === "failed") throw Object.assign(new Error("synthetic quiet timeout"), { code: "ETIMEDOUT" });
+      return Buffer.from(fail ? "\uFEFF Synthetic\r\n" : "\uFEFF\u0000 \r\n", "utf16le");
+    } };
+    let runtime = scopedModules(options);
+    const sync = async () => {
+      const diagnostics = {};
+      await runtime.load("src/commands/sync.js").cmdSync([
+        "--auto", "--from-notify", "--source", "command-code", "--background", "--all-local-sources",
+      ], { diagnostics, cursorStoreOptions: { forceV2: true } });
+      return diagnostics;
+    };
+    const queue = path.join(home, ".tokentracker", "tracker", "queue.jsonl");
+    const project = path.join(home, ".tokentracker", "tracker", "project.queue.jsonl");
+    const initial = await sync();
+    assert.deepEqual(readRows(queue), [ROW]);
+    assert.deepEqual(readRows(project), [PROJECT_ROW]);
+    const core = fs.readFileSync(initial.cursor_path);
+    const hourly = fs.readFileSync(queue);
+    const projectBytes = fs.readFileSync(project);
+    // A new private graph models restart, not a global cache reset. After the
+    // failure, recovery below keeps this same graph and its failed cache.
+    runtime = scopedModules(options);
+    fail = true;
+    const failed = await sync();
+    assert.equal(failed.cursor_commits, 0);
+    assert.deepEqual(fs.readFileSync(failed.cursor_path), core);
+    assert.deepEqual(fs.readFileSync(queue), hourly);
+    assert.deepEqual(fs.readFileSync(project), projectBytes);
+    fail = false;
+    fs.appendFileSync(file, message("m2") + "\n");
+    const recovered = await sync();
+    assert.equal(recovered.cursor_commits, 1);
+    assert.deepEqual(readRows(queue), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
+    assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
+    const repeated = await sync();
+    assert.equal(repeated.cursor_commits, 0);
+    assert.deepEqual(readRows(queue), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
+    assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
+  });
+}
