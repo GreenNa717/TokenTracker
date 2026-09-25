@@ -23128,9 +23128,9 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 //  1. AI SDK-normalized `inputTokens` ALREADY INCLUDES cache reads and writes.
 //     `uncached = inputTokens - cacheReadTokens - cacheWriteTokens`; keeping
 //     either cache category in input double counts it in `total_tokens`.
-//  2. `costUsd` is the request cost recorded by Command Code. Local readers
-//     prefer this value (SOURCES_WITH_AUTHORITATIVE_COST in pricing/index.js)
-//     instead of replacing it with a different model-table estimate.
+//  2. `costUsd` is the request cost reported by Command Code. Local readers
+//     prefer positive recorded values (SOURCES_WITH_AUTHORITATIVE_COST in
+//     pricing/index.js) to model-table estimates; this is not bill verification.
 //
 // Transcripts are append-only in practice, but a resume/compaction REWRITES the
 // file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
@@ -23277,11 +23277,12 @@ function commandCodeUsageToTotals(usage) {
   };
 }
 
-// Read the top-level metadata of one transcript line. Message bodies are never
-// materialized: each field is sliced out of the raw text (findDshJsonProperty)
-// and only the small `usage` object is ever handed to JSON.parse — prompts,
-// replies and code are not allowed to reach this process (privacy rule in
-// CONTRIBUTING.md, asserted by the parser test's JSON.parse guard).
+// Extract selected top-level metadata from transcript text scanned locally.
+// findDshJsonProperty slices the needed fields; JSON decoding is limited to
+// selected metadata rather than whole message records or their bodies.
+// Raw transcript text is present in memory while scanning; prompt, reply and
+// code bodies are not persisted or uploaded by this reader. The parser test's
+// JSON.parse guard checks that body content is not JSON-decoded.
 function extractCommandCodeLine(line) {
   const raw = String(line || "");
   if (!raw.trim()) return null;
