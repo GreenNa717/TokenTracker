@@ -4174,7 +4174,15 @@ function normalizeOpencodeModelFields(msg) {
   return { modelId: null, providerId: "" };
 }
 
-async function resolveProjectMetaForPath(startDir, cache) {
+// Reconciliation callers can require complete metadata observations. Other
+// providers retain the existing best-effort missing-project fallback.
+function projectMetadataFallback(error, strictIo, fallback) {
+  const missing = error?.code === "ENOENT" || error?.code === "ENOTDIR" || error?.code === "EISDIR";
+  if (strictIo && !missing) throw error;
+  return fallback;
+}
+
+async function resolveProjectMetaForPath(startDir, cache, { strictIo = false } = {}) {
   if (!startDir || typeof startDir !== "string") return null;
   if (cache && cache.has(startDir)) return cache.get(startDir);
 
@@ -4195,10 +4203,10 @@ async function resolveProjectMetaForPath(startDir, cache) {
     }
     visited.push(current);
 
-    const configPath = await resolveGitConfigPath(current);
+    const configPath = await resolveGitConfigPath(current, { strictIo });
     if (configPath) {
-      const configStat = await fs.stat(configPath).catch(() => null);
-      const remoteUrl = await readGitRemoteUrl(configPath);
+      const configStat = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
+      const remoteUrl = await readGitRemoteUrl(configPath, { strictIo });
       const projectRef = canonicalizeProjectRef(remoteUrl);
       const meta = {
         projectRef: projectRef || null,
@@ -4436,9 +4444,10 @@ async function resolveProjectContextForPath({
   publicRepoCache,
   publicRepoResolver,
   projectState,
+  strictIo = false,
 }) {
   if (!startDir) return null;
-  const projectMeta = await resolveProjectMetaForPath(startDir, projectMetaCache);
+  const projectMeta = await resolveProjectMetaForPath(startDir, projectMetaCache, { strictIo });
   if (!projectMeta) return null;
   const resolver =
     typeof publicRepoResolver === "function" ? publicRepoResolver : defaultPublicRepoResolver;
@@ -4515,17 +4524,17 @@ async function resolveClaudeFileCwd(filePath) {
   return null;
 }
 
-async function resolveGitConfigPath(rootDir) {
+async function resolveGitConfigPath(rootDir, { strictIo = false } = {}) {
   const gitPath = path.join(rootDir, ".git");
-  const st = await fs.stat(gitPath).catch(() => null);
+  const st = await fs.stat(gitPath).catch((error) => projectMetadataFallback(error, strictIo, null));
   if (!st) return null;
   if (st.isDirectory()) {
     const configPath = path.join(gitPath, "config");
-    const cfg = await fs.stat(configPath).catch(() => null);
+    const cfg = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
     return cfg && cfg.isFile() ? configPath : null;
   }
   if (st.isFile()) {
-    const content = await fs.readFile(gitPath, "utf8").catch(() => "");
+    const content = await fs.readFile(gitPath, "utf8").catch((error) => projectMetadataFallback(error, strictIo, ""));
     const match = content.match(/gitdir:\s*(.+)/i);
     if (!match) return null;
     let gitDir = match[1].trim();
@@ -4534,10 +4543,11 @@ async function resolveGitConfigPath(rootDir) {
       gitDir = path.resolve(rootDir, gitDir);
     }
     const configPath = path.join(gitDir, "config");
-    const cfg = await fs.stat(configPath).catch(() => null);
+    const cfg = await fs.stat(configPath).catch((error) => projectMetadataFallback(error, strictIo, null));
     if (cfg && cfg.isFile()) return configPath;
 
-    const commonDirRaw = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => "");
+    const commonDirRaw = await fs.readFile(path.join(gitDir, "commondir"), "utf8")
+      .catch((error) => projectMetadataFallback(error, strictIo, ""));
     const commonDirRel = commonDirRaw.trim();
     if (!commonDirRel) return null;
     let commonDir = commonDirRel;
@@ -4545,14 +4555,14 @@ async function resolveGitConfigPath(rootDir) {
       commonDir = path.resolve(gitDir, commonDir);
     }
     const commonConfigPath = path.join(commonDir, "config");
-    const commonCfg = await fs.stat(commonConfigPath).catch(() => null);
+    const commonCfg = await fs.stat(commonConfigPath).catch((error) => projectMetadataFallback(error, strictIo, null));
     return commonCfg && commonCfg.isFile() ? commonConfigPath : null;
   }
   return null;
 }
 
-async function readGitRemoteUrl(configPath) {
-  const raw = await fs.readFile(configPath, "utf8").catch(() => "");
+async function readGitRemoteUrl(configPath, { strictIo = false } = {}) {
+  const raw = await fs.readFile(configPath, "utf8").catch((error) => projectMetadataFallback(error, strictIo, ""));
   if (!raw.trim()) return null;
 
   const remotes = new Map();
@@ -23141,7 +23151,7 @@ function resolveCommandCodeHomes(env = process.env, deps = {}) {
 
   const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
   const wslValue = wsl.shouldProbeWsl(env)
-    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env, existsSync })
+    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env, existsSync, strict: true })
     : null;
   if (probeError) throw probeError;
   const resolved = wsl.resolveAllWin32Paths({
@@ -23476,6 +23486,7 @@ async function parseCommandCodeIncremental({
           publicRepoCache,
           publicRepoResolver,
           projectState,
+          strictIo: true,
         });
         projectKey = context?.projectKey || null;
         projectRef = context?.projectRef || null;

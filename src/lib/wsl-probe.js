@@ -4,11 +4,15 @@ const path = require("node:path");
 const DEFAULT_EXEC_OPTS = { timeout: 15000, windowsHide: true, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] };
 
 let _cachedDistros = null;
+let _cachedDistrosError = null;
 const _cachedWslUsers = new Map();
+const _cachedWslUserErrors = new Map();
 
 function resetWslProbeCache() {
   _cachedDistros = null;
+  _cachedDistrosError = null;
   _cachedWslUsers.clear();
+  _cachedWslUserErrors.clear();
 }
 
 const WSL_MODES = new Set([
@@ -47,19 +51,31 @@ function parseWslListVerbose(raw) {
 }
 
 function probeWslDistros(deps = {}) {
-  const hasDeps = Object.keys(deps).length > 0;
-  if (!hasDeps && _cachedDistros) return _cachedDistros;
+  const strict = deps.strict === true;
+  const hasDeps = Object.keys(deps).some((key) => key !== "strict");
+  // Legacy callers retain their fail-safe cache. Strict observers may reuse
+  // successful empty results, but must retry a failure cached by any caller.
+  if (!hasDeps && _cachedDistros && (!strict || !_cachedDistrosError)) return _cachedDistros;
   const runWsl = deps.runWsl || defaultRunWsl;
   let raw;
   try {
     raw = runWsl(["-l", "-v"], { utf16: true });
-  } catch (_e) {
-    if (!hasDeps) _cachedDistros = [];
+  } catch (error) {
+    if (!hasDeps) {
+      _cachedDistros = [];
+      _cachedDistrosError = error;
+    }
+    // ENOENT confirms wsl.exe is not installed. A failed invocation of an
+    // existing executable is not evidence of an empty distro list.
+    if (strict && error?.code !== "ENOENT") throw error;
     return [];
   }
   const distros = parseWslListVerbose(raw);
   const sorted = distros.sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0));
-  if (!hasDeps) _cachedDistros = sorted;
+  if (!hasDeps) {
+    _cachedDistros = sorted;
+    _cachedDistrosError = null;
+  }
   return sorted;
 }
 
@@ -125,15 +141,22 @@ function resolveAllWin32Paths({
   return { native: single, wsl: null };
 }
 
-function lookupWslUser(distroName, runWsl, useCache) {
-  if (useCache && _cachedWslUsers.has(distroName)) {
+function lookupWslUser(distroName, runWsl, useCache, strict = false) {
+  if (useCache && _cachedWslUsers.has(distroName) && (!strict || !_cachedWslUserErrors.has(distroName))) {
     return _cachedWslUsers.get(distroName);
   }
   let user = "";
+  let error = null;
   try {
     user = String(runWsl(["-d", distroName, "-e", "whoami"], { utf16: false }) || "").trim();
-  } catch (_e) { }
-  if (useCache) _cachedWslUsers.set(distroName, user);
+    if (!user) error = Object.assign(new Error("WSL identity probe returned no user"), { code: "EWSLIDENTITY" });
+  } catch (cause) { error = cause; }
+  if (useCache) {
+    _cachedWslUsers.set(distroName, user);
+    if (error) _cachedWslUserErrors.set(distroName, error);
+    else _cachedWslUserErrors.delete(distroName);
+  }
+  if (strict && error) throw error;
   return user;
 }
 
@@ -142,10 +165,13 @@ function discoverWslHome(providerDir, deps = {}) {
 
   const runWsl = deps.runWsl || defaultRunWsl;
   const existsSync = deps.existsSync || fssync.existsSync;
-  const distros = deps.runWsl ? probeWslDistros({ runWsl: deps.runWsl }) : probeWslDistros();
+  const strict = deps.strict === true;
+  const distros = deps.runWsl
+    ? probeWslDistros({ runWsl: deps.runWsl, strict })
+    : probeWslDistros(strict ? { strict } : undefined);
   const useCache = !deps.runWsl;
   for (const distro of distros) {
-    const user = lookupWslUser(distro.name, runWsl, useCache);
+    const user = lookupWslUser(distro.name, runWsl, useCache, strict);
     if (!user) continue;
     const roots = distro.version === 1
       ? ["\\\\wsl.localhost\\", "\\\\wsl$\\"]
