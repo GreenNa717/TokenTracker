@@ -4525,7 +4525,7 @@ describe("getUsageLimits plan_label", () => {
 
   // Grok bypasses withPlanLabel on purpose: the shared normalizer Title-Cases
   // ("Supergrok Heavy", "Api Key") and maps "free" to null, but xAI's
-  // subscriptionTier is already the exact product name and Free is a tier users
+  // subscription_tier_display is already the exact product name and Free is a tier users
   // asked to see (#635). Routing grok back through withPlanLabel breaks both.
   it("surfaces Grok's subscription tier verbatim, including Free", async () => {
     async function grokPlanLabel(subscriptionTier) {
@@ -4556,7 +4556,6 @@ describe("getUsageLimits plan_label", () => {
                 ok: true,
                 status: 200,
                 json: async () => ({
-                  subscriptionTier,
                   config: {
                     currentPeriod: {
                       type: "USAGE_PERIOD_TYPE_WEEKLY",
@@ -4570,6 +4569,11 @@ describe("getUsageLimits plan_label", () => {
                   },
                 }),
               });
+            }
+            if (url === "https://cli-chat-proxy.grok.com/v1/settings") {
+              return Promise.resolve({ ok: true, status: 200, json: async () => ({
+                subscription_tier_display: subscriptionTier,
+              }) });
             }
             return pendingUnlessCodexReset(url);
           },

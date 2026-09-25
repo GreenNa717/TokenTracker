@@ -232,10 +232,17 @@ final class StatusBarController: NSObject {
         }
         let islandEnabled = UserDefaults.standard.bool(forKey: DynamicIslandController.enabledDefaultsKey)
         // Never leave the user with zero UI: only hide menu bar icon if Dynamic Island is active.
+        let wasVisible = statusItem.isVisible
         statusItem.isVisible = MenuBarSurfacePolicy.isIconVisible(
             hideRequested: hideRequested,
             islandEnabled: islandEnabled
         )
+        animator?.updatesButton = statusItem.isVisible
+        // Frames skipped the button while hidden; catch it up so a paused
+        // animation (sleeping, reduced motion) doesn't show a stale icon.
+        if animator != nil, statusItem.isVisible, !wasVisible {
+            updateStatsDisplay()
+        }
     }
 
     private func observeApplicationActivity() {
@@ -267,9 +274,13 @@ final class StatusBarController: NSObject {
         updateMenuBarIconVisibility()
 
         animator = MenuBarAnimator(button: button)
+        animator?.updatesButton = statusItem.isVisible
         animator?.onImageUpdated = { [weak self] image in
             guard let self else { return }
-            if self.showStats, !self.buildMenuBarDisplayValues().isEmpty {
+            // Hidden status item (island-only setup): the composite is never
+            // seen, so skip rebuilding it every frame. `updateMenuBarIconVisibility`
+            // re-composites when the item comes back.
+            if self.statusItem.isVisible, self.showStats, !self.buildMenuBarDisplayValues().isEmpty {
                 self.updateStatsDisplay()
             }
             NotificationCenter.default.post(name: .menuBarIconFrameUpdated, object: image)
@@ -914,6 +925,13 @@ final class StatusBarController: NSObject {
             }
         }
 
+        // Edge guard: a panel opened under an icon near a screen edge can end
+        // up off-screen. Re-check once the window server has committed the
+        // show; a correctly placed popover is a no-op.
+        DispatchQueue.main.async { [weak self] in
+            self?.realignPopoverWithAnchorIfDisplaced()
+        }
+
         popoverDismissMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
@@ -977,18 +995,30 @@ final class StatusBarController: NSObject {
     // App-wide activation can still yank the reused _NSPopoverWindow onto another
     // display's Space (#481). The anchor window is canJoinAllSpaces and pinned in
     // screen coordinates under the clicked status item, so it is the ground truth:
-    // if the popover window strayed from it, move the popover window back.
+    // if the popover window strayed from it, move the popover window back. The
+    // restored position is screen-clamped — hard-centering under the anchor pushes
+    // the panel off-screen when the icon sits near a screen edge.
     private func realignPopoverWithAnchorIfDisplaced() {
         guard popover.isShown,
               let popoverWindow = popover.contentViewController?.view.window,
               let anchorWindow = popoverAnchorWindow else { return }
+        guard let screen = anchorWindow.screen
+            ?? NSScreen.screens.first(where: { $0.frame.intersects(anchorWindow.frame) })
+            ?? NSScreen.main else { return }
         let anchor = anchorWindow.frame
         var frame = popoverWindow.frame
         let displaced = popoverWindow.screen !== anchorWindow.screen
-            || abs(frame.midX - anchor.midX) > frame.width / 2
-            || abs(frame.maxY - anchor.minY) > 24
+            || PopoverPlacementPolicy.isDisplaced(
+                popoverFrame: frame,
+                anchorFrame: anchor,
+                screenFrame: screen.frame
+            )
         guard displaced else { return }
-        frame.origin.x = anchor.midX - frame.width / 2
+        frame.origin.x = PopoverPlacementPolicy.originX(
+            bodyWidth: frame.width,
+            anchorMidX: anchor.midX,
+            screenFrame: screen.frame
+        )
         frame.origin.y = anchor.minY - frame.height
         popoverWindow.setFrame(frame, display: true)
     }

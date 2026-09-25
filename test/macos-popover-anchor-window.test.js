@@ -136,6 +136,16 @@ test("menu-bar popover restores Tahoe glass via deferred activation with a reali
   );
   assert.match(
     togglePopover,
+    /addChildWindow[\s\S]*?DispatchQueue\.main\.async\s*\{\s*\[weak self\]\s*in\s*self\?\.realignPopoverWithAnchorIfDisplaced\(\)\s*\}\s*popoverDismissMonitor/,
+    "Every show must run a next-tick realign so an edge-clipped popover is pulled back on-screen.",
+  );
+  assert.match(
+    source,
+    /private\s+func\s+realignPopoverWithAnchorIfDisplaced\(\)\s*\{[\s\S]*?guard\s+let\s+screen\s*=\s*anchorWindow\.screen[\s\S]*?frame\.origin\.x\s*=\s*PopoverPlacementPolicy\.originX\([\s\S]*?screenFrame:\s*screen\.frame/,
+    "Realign must screen-clamp the origin against the anchor's own screen; hard-centering or clamping against a wrong screen frame pushes the panel off-screen near an edge.",
+  );
+  assert.match(
+    togglePopover,
     /window\.makeKey\(\)/,
     "The popover window should remain key for keyboard and VoiceOver interaction.",
   );
