@@ -23081,10 +23081,9 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 //  1. AI SDK-normalized `inputTokens` ALREADY INCLUDES cache reads and writes.
 //     `uncached = inputTokens - cacheReadTokens - cacheWriteTokens`; keeping
 //     either cache category in input double counts it in `total_tokens`.
-//  2. `costUsd` is the exact amount Command Code billed for the request, so
-//     this source is cost-authoritative (SOURCES_WITH_AUTHORITATIVE_COST in
-//     pricing/index.js). That also keeps DeepSeek's peak-hour table rates from
-//     billing a subscription that charges a flat rate (issue #642).
+//  2. `costUsd` is the request cost recorded by Command Code. Local readers
+//     prefer this value (SOURCES_WITH_AUTHORITATIVE_COST in pricing/index.js)
+//     instead of replacing it with a different model-table estimate.
 //
 // Transcripts are append-only in practice, but a resume/compaction REWRITES the
 // file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
@@ -23181,7 +23180,7 @@ function normalizeCommandCodeModelName(value) {
 // Map Command Code's usage object onto disjoint queue columns. `inputTokens`
 // already includes cache reads and writes (see the section comment), so subtract
 // both back out first; returns null for an all-zero record. `costUsd` is the
-// provider-reported bill; zero keeps the repository-wide "unreported" sentinel
+// CLI-recorded cost; zero keeps the repository-wide "unreported" sentinel
 // and falls through to model pricing on the read side.
 function commandCodeUsageToTotals(usage) {
   if (!usage || typeof usage !== "object") return null;
